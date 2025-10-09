@@ -45,7 +45,7 @@
 #define PIN_LAMP2 6
 
 // ======= LED strips =======
-#define PIXELS_PER_GATE 60
+#define PIXELS_PER_GATE 50
 #define STRIP_A_PIX (4 * PIXELS_PER_GATE) // G34,G23,G12,G1
 #define STRIP_B_PIX (4 * PIXELS_PER_GATE) // G35,G24,G13,G2
 Adafruit_NeoPixel stripA(STRIP_A_PIX, PIN_LED_STRIP_A, NEO_GRB + NEO_KHZ800);
@@ -143,7 +143,7 @@ static void onNowRecv(const esp_now_recv_info* info, const uint8_t* data, int le
     sendOtaAck(0);
     // Defer Wi‑Fi switch/HTTP update to the main loop (like Pizza) to avoid doing it in the recv callback
     if (url.length() > 0) { strncpy(gOtaUrlBuf, url.c_str(), sizeof(gOtaUrlBuf)-1); }
-    else { gOtaUrlBuf[0] = '�'; }
+    else { snprintf(gOtaUrlBuf, sizeof(gOtaUrlBuf), "%s%s", OTA_BASE_URL, OTA_NODE_PATH); }
     gOtaPending = true;
     return;
   }

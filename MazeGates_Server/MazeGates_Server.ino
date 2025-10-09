@@ -82,16 +82,18 @@ static void onNowRecv(const esp_now_recv_info* info, const uint8_t* data, int le
 }
 
 // --- Node 4 LED routing helper (only L9/L10 for bring‑up) ---
-static bool routeGateToNode4(uint8_t gateId, /*out*/uint8_t &strip, uint16_t &start){
-  const uint16_t N=60; switch (gateId){
-    case 34: strip=0; start=0*N; return true;  // L9 seg0
-    case 23: strip=0; start=1*N; return true;  // L9 seg1
-    case 12: strip=0; start=2*N; return true;  // L9 seg2
-    case 1:  strip=0; start=3*N; return true;  // L9 seg3
-    case 35: strip=1; start=0*N; return true;  // L10 seg0
-    case 24: strip=1; start=1*N; return true;  // L10 seg1
-    case 13: strip=1; start=2*N; return true;  // L10 seg2
-    case 2:  strip=1; start=3*N; return true;  // L10 seg3
+static bool routeGateToNode4(uint8_t gateId, /*out*/uint8_t &strip, uint16_t &start) {
+  // L9 (strip 0): G34(45), G23(45), G12(45), G1(50)
+  // L10 (strip 1): G35(45), G24(45), G13(45), G2(50)
+  switch (gateId) {
+    case 34: strip = 0; start =   0;  return true;
+    case 23: strip = 0; start =  45;  return true;
+    case 12: strip = 0; start =  90;  return true;
+    case 1:  strip = 0; start = 135;  return true; // 50 px
+    case 35: strip = 1; start =   0;  return true;
+    case 24: strip = 1; start =  45;  return true;
+    case 13: strip = 1; start =  90;  return true;
+    case 2:  strip = 1; start = 135;  return true; // 50 px
     default: return false;
   }
 }
@@ -129,11 +131,16 @@ static void handleCli(String s){
     return;
   }
 
-  if (s.startsWith("setgate ")){
-    int gid,r,g,b; if (sscanf(s.c_str(),"setgate %d %d %d %d", &gid,&r,&g,&b)==4){
-      uint8_t strip; uint16_t start; if (routeGateToNode4((uint8_t)gid, strip, start)){
-        sendLedRange(/*nodeId*/4, strip, start, 60, (uint8_t)r,(uint8_t)g,(uint8_t)b);
-        Serial.printf("LED_RANGE node4 strip=%u start=%u count=60 rgb(%d,%d,%d)\n", strip,start,r,g,b);
+  if (s.startsWith("setgate ")) {
+    int gid, r, g, b;
+    if (sscanf(s.c_str(), "setgate %d %d %d %d", &gid, &r, &g, &b) == 4) {
+      uint8_t strip; uint16_t start;
+      if (routeGateToNode4((uint8_t)gid, strip, start)) {
+        int gateCount = (gid == 1 || gid == 2) ? 50 : 45;  // Node4: L9/L10 last segments are 50
+        sendLedRange(/*nodeId*/4, strip, start, (uint16_t)gateCount,
+                    (uint8_t)r, (uint8_t)g, (uint8_t)b);
+        Serial.printf("LED_RANGE node4 strip=%u start=%u count=%d rgb(%d,%d,%d)\n",
+                      strip, start, gateCount, r, g, b);
       } else {
         Serial.println("Gate not on Node4's strips in this harness.");
       }
