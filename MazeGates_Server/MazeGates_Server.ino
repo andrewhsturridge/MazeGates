@@ -1,18 +1,19 @@
 /*
- * Maze Gates – Server Harness v0
+ * Maze Gates – Server Harness v0 (clean compile)
  * Board: ESP32 (any), Transport: ESP‑NOW ch.6
- * Uses a minimal copy of the message types from Node4 sketch.
+ * Reuses message types from Node4; adds roster, lamp, and ota commands.
  */
 
 #include <Arduino.h>
 #include <WiFi.h>
-#include <esp_now.h>
 #include <esp_wifi.h>
+#include <esp_now.h>
 #include <map>
 #include <vector>
+#include <cstring>
 
 // ======= Protocol (same as node) =======
-enum MsgType : uint8_t { HELLO=1, HELLO_REQ=2, CLAIM=3, GATE_EVENT=10, LED_RANGE=20, BUTTON_EVENT=30 };
+enum MsgType : uint8_t { HELLO=1, HELLO_REQ=2, CLAIM=3, GATE_EVENT=10, LED_RANGE=20, LAMP_CTRL=21, BUTTON_EVENT=30, OTA_START=50, OTA_ACK=51 };
 struct __attribute__((packed)) PktHeader { uint8_t type, version, nodeId, pad; uint16_t seq, len; };
 static const uint8_t PROTO_VER = 1;
 struct __attribute__((packed)) HelloMsg { PktHeader h; uint8_t role; uint8_t caps; };
@@ -20,6 +21,9 @@ struct __attribute__((packed)) ClaimMsg { PktHeader h; uint8_t newNodeId; };
 struct __attribute__((packed)) GateEventMsg { PktHeader h; uint8_t gateId; uint8_t ev; uint16_t strengthMm; uint32_t tsMs; };
 struct __attribute__((packed)) ButtonEventMsg { PktHeader h; uint8_t btnIdx; uint8_t ev; uint32_t tsMs; };
 struct __attribute__((packed)) LedRangeMsg { PktHeader h; uint8_t strip; uint16_t start, count; uint8_t effect; uint8_t r,g,b; uint16_t durationMs; };
+struct __attribute__((packed)) LampCtrlMsg { PktHeader h; uint8_t idx; uint8_t on; };
+struct __attribute__((packed)) OtaStartMsg { PktHeader h; char url[200]; };
+struct __attribute__((packed)) OtaAckMsg { PktHeader h; uint8_t status; /*0=starting*/ };
 
 static uint16_t gSeq=1; static uint8_t kBroadcast[6]={0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 
@@ -34,7 +38,7 @@ static String macToStr(const uint8_t m[6]){
 static void addOrUpdateNode(uint8_t nodeId, const uint8_t mac[6]){
   NodeInfo n{nodeId,{0}}; memcpy(n.mac,mac,6); nodesById[nodeId]=n; macStrToNodeId[macToStr(mac)] = nodeId;
   // ensure peer exists
-  esp_now_peer_info_t p{}; memcpy(p.peer_addr,mac,6); p.channel=6; p.encrypt=false; esp_now_add_peer(&p);
+  esp_now_peer_info_t p{}; memcpy(p.peer_addr,mac,6); p.channel=6; p.encrypt=false; p.ifidx = WIFI_IF_STA; esp_now_add_peer(&p);
 }
 
 static void sendRaw(const uint8_t mac[6], const uint8_t* data, size_t len){ esp_now_send(mac, data, len); }
@@ -48,26 +52,32 @@ static void sendLedRange(uint8_t nodeId, uint8_t strip, uint16_t start, uint16_t
   m.strip=strip; m.start=start; m.count=count; m.effect=0; m.r=r; m.g=g; m.b=b; m.durationMs=0; sendRaw(it->second.mac,(uint8_t*)&m,sizeof(m));
 }
 
-static void onNowRecv(const esp_now_recv_info* info, const uint8_t* data, int len){
-  if (!info || len < (int)sizeof(PktHeader)) return;
-  const uint8_t* mac = info->src_addr;
-  auto *h = (const PktHeader*)data;
-  if (h->version != PROTO_VER) return;
+static void sendLampCtrl(uint8_t nodeId, uint8_t idx, bool on){
+  auto it=nodesById.find(nodeId); if (it==nodesById.end()) return;
+  LampCtrlMsg m{}; m.h={LAMP_CTRL,PROTO_VER,0,0,gSeq++,sizeof(LampCtrlMsg)}; m.idx=idx; m.on=on?1:0;
+  sendRaw(it->second.mac,(uint8_t*)&m,sizeof(m));
+}
 
-  if (h->type == HELLO) {
-    uint8_t nid = h->nodeId;
-    addOrUpdateNode(nid, mac);
-    Serial.printf("HELLO from node %u (%02X:%02X:%02X:%02X:%02X:%02X)\n",
-                  nid, mac[0],mac[1],mac[2],mac[3],mac[4],mac[5]);
-  } else if (h->type == GATE_EVENT && len >= (int)sizeof(GateEventMsg)) {
-    auto *m = (const GateEventMsg*)data;
-    Serial.printf("GATE %u %s mm=%u from node %u\n",
-      m->gateId, (m->ev==1?"ENTER":(m->ev==2?"EXIT":"?")),
-      m->strengthMm, h->nodeId);
-  } else if (h->type == BUTTON_EVENT && len >= (int)sizeof(ButtonEventMsg)) {
-    auto *m = (const ButtonEventMsg*)data;
-    Serial.printf("BUTTON%u %s from node %u\n",
-      m->btnIdx, (m->ev==1?"PRESS":"RELEASE"), h->nodeId);
+static void sendOtaStart(uint8_t nodeId, const String& url){
+  auto it=nodesById.find(nodeId); if (it==nodesById.end()) return;
+  OtaStartMsg m{}; m.h={OTA_START,PROTO_VER,0,0,gSeq++,sizeof(OtaStartMsg)};
+  memset(m.url, 0, sizeof(m.url));
+  if (url.length()>0) strncpy(m.url, url.c_str(), sizeof(m.url)-1);
+  sendRaw(it->second.mac,(uint8_t*)&m,sizeof(m));
+}
+
+static void onNowRecv(const esp_now_recv_info* info, const uint8_t* data, int len){
+  if (!info || len < (int)sizeof(PktHeader)) return; auto *h=(const PktHeader*)data; if (h->version!=PROTO_VER) return;
+  const uint8_t* mac = info->src_addr;
+  if (h->type==HELLO){ uint8_t nid=h->nodeId; addOrUpdateNode(nid, mac); Serial.printf("HELLO from node %u (%s)\n", nid, macToStr(mac).c_str()); }
+  else if (h->type==GATE_EVENT && len>=(int)sizeof(GateEventMsg)){
+    auto *m=(const GateEventMsg*)data; Serial.printf("GATE %u %s mm=%u from node %u\n", m->gateId, (m->ev==1?"ENTER":(m->ev==2?"EXIT":"?")), m->strengthMm, h->nodeId);
+  }
+  else if (h->type==OTA_ACK && len>=(int)sizeof(OtaAckMsg)){
+    auto *m=(const OtaAckMsg*)data; Serial.printf("OTA_ACK from node %u (status=%u)\n", h->nodeId, m->status);
+  }
+  else if (h->type==BUTTON_EVENT && len>=(int)sizeof(ButtonEventMsg)){
+    auto *m=(const ButtonEventMsg*)data; Serial.printf("BUTTON%u %s from node %u\n", m->btnIdx, (m->ev==1?"PRESS":"RELEASE"), h->nodeId);
   }
 }
 
@@ -88,20 +98,27 @@ static bool routeGateToNode4(uint8_t gateId, /*out*/uint8_t &strip, uint16_t &st
 
 void setup(){
   Serial.begin(115200);
-  WiFi.mode(WIFI_STA);
-  esp_wifi_set_channel(6, WIFI_SECOND_CHAN_NONE);
-  ESP_ERROR_CHECK( esp_now_init() );
-  esp_now_register_recv_cb(onNowRecv);
-  
+  WiFi.mode(WIFI_STA); esp_wifi_set_channel(6, WIFI_SECOND_CHAN_NONE); esp_now_init(); esp_now_register_recv_cb(onNowRecv);
   // Add broadcast peer for HELLO_REQ
-  esp_now_peer_info_t p{}; memcpy(p.peer_addr,kBroadcast,6); p.channel=6; p.encrypt=false; esp_now_add_peer(&p);
+  esp_now_peer_info_t p{}; memcpy(p.peer_addr,kBroadcast,6); p.channel=6; p.encrypt=false; p.ifidx = WIFI_IF_STA; esp_now_add_peer(&p);
   delay(200);
   bcastHelloReq();
-  Serial.println("Commands:\n  claim <nodeId> <mac>\n  setgate <gateId> <r> <g> <b>\n  hello");
+  Serial.println(
+    "Commands:\n"
+    "  claim <nodeId> <mac>\n"
+    "  setgate <gateId> <r> <g> <b>\n"
+    "  lamp <nodeId> <idx> <on|off>\n"
+    "  ota <nodeId> [url]\n"
+    "  hello\n"
+    "  roster"
+  );
 }
 
 static void handleCli(String s){
-  s.trim(); if (s=="hello"){ bcastHelloReq(); return; }
+  s.trim();
+  if (s=="hello"){ bcastHelloReq(); return; }
+  if (s=="roster"){ for (auto &kv : nodesById){ auto &n=kv.second; Serial.printf("node %u @ %02X:%02X:%02X:%02X:%02X:%02X\n", n.nodeId,n.mac[0],n.mac[1],n.mac[2],n.mac[3],n.mac[4],n.mac[5]); } return; }
+
   if (s.startsWith("claim ")){
     // claim 4 AA:BB:CC:DD:EE:FF
     int nid; char macs[32]; if (sscanf(s.c_str(),"claim %d %31s", &nid, macs)==2){
@@ -111,6 +128,7 @@ static void handleCli(String s){
     }
     return;
   }
+
   if (s.startsWith("setgate ")){
     int gid,r,g,b; if (sscanf(s.c_str(),"setgate %d %d %d %d", &gid,&r,&g,&b)==4){
       uint8_t strip; uint16_t start; if (routeGateToNode4((uint8_t)gid, strip, start)){
@@ -120,6 +138,23 @@ static void handleCli(String s){
         Serial.println("Gate not on Node4's strips in this harness.");
       }
     }
+    return;
+  }
+
+  if (s.startsWith("lamp ")){
+    int nid, idx; char onoff[8]={0};
+    if (sscanf(s.c_str(),"lamp %d %d %7s", &nid, &idx, onoff)==3){
+      bool on = (String(onoff)=="on");
+      sendLampCtrl((uint8_t)nid, (uint8_t)idx, on);
+      Serial.printf("LAMP node=%d idx=%d %s\n", nid, idx, on?"ON":"OFF");
+    }
+    return;
+  }
+
+  if (s.startsWith("ota ")){
+    int nid; char url[256]={0}; int n=sscanf(s.c_str(),"ota %d %255s", &nid, url);
+    sendOtaStart((uint8_t)nid, (n==2)?String(url):String());
+    Serial.printf("OTA_START node=%d %s\n", nid, (n==2)?url:"<default>");
     return;
   }
 }
