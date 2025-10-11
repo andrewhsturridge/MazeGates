@@ -91,8 +91,62 @@ static bool getSegmentForGate(uint8_t gateId, GateSeg &seg) {
   }
 }
 
+// Node 4 TCA mapping (from CSV)
+static uint8_t kGateByTcaPort[8] = {
+  /*ch0 (port1)*/ 23,
+  /*ch1 (port2)*/ 24,
+  /*ch2 (port3)*/ 28,
+  /*ch3 (port4)*/ 29,
+  /*ch4 (port5)*/ 34,
+  /*ch5 (port6)*/ 35,
+  /*ch6 (port7)*/ 39,
+  /*ch7 (port8)*/ 40
+};
+
+static uint8_t  reinitCount[8] = {0};
+
+// ======= VL53L4CX (8 sensors, test-style) =======
+#define DEV_I2C Wire
+#define NUM_SENSORS 8
+
+VL53L4CX tof0(&DEV_I2C, 255);
+VL53L4CX tof1(&DEV_I2C, 255);
+VL53L4CX tof2(&DEV_I2C, 255);
+VL53L4CX tof3(&DEV_I2C, 255);
+VL53L4CX tof4(&DEV_I2C, 255);
+VL53L4CX tof5(&DEV_I2C, 255);
+VL53L4CX tof6(&DEV_I2C, 255);
+VL53L4CX tof7(&DEV_I2C, 255);
+VL53L4CX* TOF[NUM_SENSORS] = { &tof0, &tof1, &tof2, &tof3, &tof4, &tof5, &tof6, &tof7 };
+
+// Per-channel init/error state (test-style)
+static bool      inited[NUM_SENSORS] = {0};
+static uint8_t   errStreak[NUM_SENSORS] = {0};
+static unsigned long lastPollMs[NUM_SENSORS] = {0};
+static const uint8_t  MAX_ERR_BEFORE_REINIT = 4;
+
+// Strict window (test behavior)
+static const uint16_t MIN_MM = 600;
+static const uint16_t MAX_MM = 2000;
+// (match test: no signal floor — add back later if you want)
+
+// Detection params
+static const uint16_t ABS_THRESH_MM = 1500; // fallback absolute
+static const uint16_t DELTA_THRESH_MM = 600; // baseline‑delta
+static const uint8_t  DEBOUNCE = 2; // consecutive samples
+static const uint16_t REARM_MS = 500;
+
+struct GateDet { bool present=false; uint8_t hits=0; uint32_t rearmUntil=0; uint16_t baseline=2000; };
+static GateDet det[8]; // by TCA port
+
+static uint32_t lastReinitScanMs = 0;
+
+// --- Jittered replies for HELLO / STATUS ---
+static volatile bool gHelloPending = false, gStatusPending = false;
+static uint32_t helloDueAt = 0, statusDueAt = 0;
+
 // ======= Protocol =======
-enum MsgType : uint8_t { HELLO=1, HELLO_REQ=2, CLAIM=3, GATE_EVENT=10, LED_RANGE=20, LAMP_CTRL=21, BUTTON_EVENT=30, OTA_START=50, OTA_ACK=51 };
+enum MsgType : uint8_t { HELLO=1, HELLO_REQ=2, CLAIM=3, GATE_EVENT=10, LED_RANGE=20, LAMP_CTRL=21, BUTTON_EVENT=30, OTA_START=50, OTA_ACK=51, NODE_STATUS = 60 };
 struct __attribute__((packed)) PktHeader { uint8_t type, version, nodeId, pad; uint16_t seq, len; };
 static const uint8_t PROTO_VER = 1;
 
@@ -104,6 +158,7 @@ struct __attribute__((packed)) LedRangeMsg { PktHeader h; uint8_t strip; uint16_
 struct __attribute__((packed)) LampCtrlMsg { PktHeader h; uint8_t idx; uint8_t on; };
 struct __attribute__((packed)) OtaStartMsg { PktHeader h; char url[200]; };
 struct __attribute__((packed)) OtaAckMsg { PktHeader h; uint8_t status; /*0=starting*/ };
+struct __attribute__((packed)) NodeStatusMsg { PktHeader h; uint32_t uptimeMs; uint8_t  initedMask; uint8_t  errStreakMax; uint8_t  reinitCount[8]; };
 
 // ======= ESP‑NOW =======
 static volatile bool gOtaPending = false;
@@ -132,11 +187,35 @@ static void sendOtaAck(uint8_t status){
   OtaAckMsg m{}; m.h={OTA_ACK,PROTO_VER,gNodeId,0,gSeq++,sizeof(OtaAckMsg)}; m.status=status;
   sendRaw(kBroadcast,(uint8_t*)&m,sizeof(m));
 }
+static void sendNodeStatus() {
+  NodeStatusMsg m{};
+  m.h = { NODE_STATUS, PROTO_VER, gNodeId, 0, gSeq++, (uint16_t)sizeof(NodeStatusMsg) };
+  m.uptimeMs = millis();
+
+  uint8_t mask = 0, maxErr = 0;
+  for (uint8_t ch=0; ch<8; ++ch) {
+    if (kGateByTcaPort[ch]==0) continue;          // only real channels
+    if (inited[ch]) mask |= (1u<<ch);
+    if (errStreak[ch] > maxErr) maxErr = errStreak[ch];
+  }
+  m.initedMask   = mask;
+  m.errStreakMax = maxErr;
+  memcpy(m.reinitCount, reinitCount, 8);
+
+  sendRaw(kBroadcast, (uint8_t*)&m, sizeof(m));
+}
 
 static void onNowRecv(const esp_now_recv_info* info, const uint8_t* data, int len){
   if (!info || len < (int)sizeof(PktHeader)) return; auto *h=(const PktHeader*)data; if (h->version!=PROTO_VER) return;
   // Re‑HELLO on demand
-  if (h->type==HELLO_REQ) { sendHello(); return; }
+  if (h->type==HELLO_REQ) { 
+    uint32_t jitter = (uint32_t)random(20, 181);   // [20,180] ms
+    helloDueAt  = millis() + jitter;
+    statusDueAt = helloDueAt + 5;        // send status right after HELLO (if you added sendNodeStatus)
+    gHelloPending  = true;
+    gStatusPending = true;
+    return; 
+  }
   // Persist CLAIM
   if (h->type==CLAIM && len>= (int)sizeof(ClaimMsg)) {
     auto *m=(const ClaimMsg*)data; gNodeId = m->newNodeId; prefs.begin("maze",false); prefs.putUChar("nodeId",gNodeId); prefs.end();
@@ -268,57 +347,6 @@ static inline bool tcaSelect(uint8_t ch) {
 }
 static void tcaOff(){ Wire.beginTransmission(TCA_ADDR); Wire.write(0); Wire.endTransmission(); }
 
-// ======= VL53L4CX (8 sensors, test-style) =======
-#define DEV_I2C Wire
-#define NUM_SENSORS 8
-
-VL53L4CX tof0(&DEV_I2C, 255);
-VL53L4CX tof1(&DEV_I2C, 255);
-VL53L4CX tof2(&DEV_I2C, 255);
-VL53L4CX tof3(&DEV_I2C, 255);
-VL53L4CX tof4(&DEV_I2C, 255);
-VL53L4CX tof5(&DEV_I2C, 255);
-VL53L4CX tof6(&DEV_I2C, 255);
-VL53L4CX tof7(&DEV_I2C, 255);
-VL53L4CX* TOF[NUM_SENSORS] = { &tof0, &tof1, &tof2, &tof3, &tof4, &tof5, &tof6, &tof7 };
-
-// Node 4 TCA mapping (from CSV)  //  <-- place this BEFORE sampleCh and reinitChannel
-static uint8_t kGateByTcaPort[8] = {
-  /*ch0 (port1)*/ 23,
-  /*ch1 (port2)*/ 24,
-  /*ch2 (port3)*/ 28,
-  /*ch3 (port4)*/ 29,
-  /*ch4 (port5)*/ 34,
-  /*ch5 (port6)*/ 35,
-  /*ch6 (port7)*/ 39,
-  /*ch7 (port8)*/ 40
-};
-
-// TCA channels (0..7) — already implied by your mapping; keep as-is
-// kGateByTcaPort[] is your gate mapping; channels are the same 0..7
-
-// Per-channel init/error state (test-style)
-static bool      inited[NUM_SENSORS] = {0};
-static uint8_t   errStreak[NUM_SENSORS] = {0};
-static unsigned long lastPollMs[NUM_SENSORS] = {0};
-static const uint8_t  MAX_ERR_BEFORE_REINIT = 4;
-
-// Strict window (test behavior)
-static const uint16_t MIN_MM = 600;
-static const uint16_t MAX_MM = 2000;
-// (match test: no signal floor — add back later if you want)
-
-// Detection params
-static const uint16_t ABS_THRESH_MM = 1500; // fallback absolute
-static const uint16_t DELTA_THRESH_MM = 600; // baseline‑delta
-static const uint8_t  DEBOUNCE = 2; // consecutive samples
-static const uint16_t REARM_MS = 500;
-
-struct GateDet { bool present=false; uint8_t hits=0; uint32_t rearmUntil=0; uint16_t baseline=2000; };
-static GateDet det[8]; // by TCA port
-
-static uint32_t lastReinitScanMs = 0;
-
 // Light re-init for a single channel if it starts erroring (test-style)
 static bool reinitChannel(uint8_t ch) {
   if (!tcaSelect(ch)) return false;
@@ -334,6 +362,8 @@ static bool reinitChannel(uint8_t ch) {
 
   errStreak[ch] = 0;
   inited[ch] = true;
+  reinitCount[ch]++;
+  sendNodeStatus();
   return true;
 }
 
@@ -439,6 +469,8 @@ void setup(){
   Serial.begin(115200);
   delay(150);           // allow sensors/mux to finish their own boot after a soft reset
 
+  randomSeed(((uint32_t)ESP.getEfuseMac()) ^ micros());
+
   pinMode(PIN_BTN1, INPUT_PULLUP); pinMode(PIN_BTN2, INPUT_PULLUP);
   pinMode(PIN_LAMP1, OUTPUT); pinMode(PIN_LAMP2, OUTPUT);
   digitalWrite(PIN_LAMP1, LOW); digitalWrite(PIN_LAMP2, LOW);
@@ -456,6 +488,7 @@ void setup(){
     esp_now_register_recv_cb(onNowRecv);
     esp_now_peer_info_t p{}; memcpy(p.peer_addr,kBroadcast,6); p.channel=6; p.encrypt=false; p.ifidx = WIFI_IF_STA; esp_now_add_peer(&p);
   }
+
   // Restore nodeId
   prefs.begin("maze", false); gNodeId = prefs.getUChar("nodeId", 4); prefs.end();
   sendHello();
@@ -484,6 +517,8 @@ void setup(){
 }
 
 void loop(){
+  uint32_t now = millis();
+
 #if TOF_ENABLED
   for (uint8_t ch=0; ch<8; ch++) sampleCh(ch);
 #endif
@@ -497,6 +532,16 @@ void loop(){
     performHttpOta(url, String(), String());
   }
 
+  if (gHelloPending && (int32_t)(now - helloDueAt) >= 0) {
+    gHelloPending = false;
+    sendHello();
+  }
+  if (gStatusPending && (int32_t)(now - statusDueAt) >= 0) {
+    gStatusPending = false;
+    sendNodeStatus();
+  }
+
+#if TOF_ENABLED
   // Background re-init scan every 2s (one channel per pass)
   if (millis() - lastReinitScanMs > 2000) {
     lastReinitScanMs = millis();
@@ -505,4 +550,5 @@ void loop(){
       if (!inited[ch]) { reinitChannel(ch); break; }  // try one per scan
     }
   }
+#endif
 }
