@@ -17,7 +17,7 @@
 static const uint8_t GATE_BY_CH_NODE4[8] = { 23, 24, 28, 29, 34, 35, 39, 40 };
 
 // ======= Protocol (same as node) =======
-enum MsgType : uint8_t { HELLO=1, HELLO_REQ=2, CLAIM=3, GATE_EVENT=10, LED_RANGE=20, LAMP_CTRL=21, BUTTON_EVENT=30, OTA_START=50, OTA_ACK=51, NODE_STATUS = 60 };
+enum MsgType : uint8_t { HELLO=1, HELLO_REQ=2, CLAIM=3, GATE_EVENT=10, LED_RANGE=20, LAMP_CTRL=21, BUTTON_EVENT=30, OTA_START=50, OTA_ACK=51, NODE_STATUS = 60, LED_MAP = 62 };
 struct __attribute__((packed)) PktHeader { uint8_t type, version, nodeId, pad; uint16_t seq, len; };
 static const uint8_t PROTO_VER = 1;
 struct __attribute__((packed)) HelloMsg { PktHeader h; uint8_t role; uint8_t caps; };
@@ -29,6 +29,11 @@ struct __attribute__((packed)) LampCtrlMsg { PktHeader h; uint8_t idx; uint8_t o
 struct __attribute__((packed)) OtaStartMsg { PktHeader h; char url[200]; };
 struct __attribute__((packed)) OtaAckMsg { PktHeader h; uint8_t status; /*0=starting*/ };
 struct __attribute__((packed)) NodeStatusMsg { PktHeader h; uint32_t uptimeMs; uint8_t  initedMask; uint8_t  errStreakMax; uint8_t  reinitCount[8]; };
+struct __attribute__((packed)) LedMapMsg {
+  PktHeader h;
+  uint8_t n;
+  struct { uint8_t pin; uint16_t count; } e[5];
+};
 
 static uint16_t gSeq=1; static uint8_t kBroadcast[6]={0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 
@@ -450,6 +455,35 @@ static void handleCli(String s){
       Serial.printf("%3u  %9lu   0x%02X     %3u   [",
                     nid, (unsigned)(st.uptimeMs/1000), st.initedMask, st.errStreakMax);
       for (int i=0;i<8;i++) { Serial.printf("%u%s", st.reinitCount[i], i==7?"]\n":","); }
+    }
+    return;
+  }
+
+  // ledmap <nodeId> <pin:count>[,<pin:count>...]
+  if (s.startsWith("ledmap ")) {
+    int nid; char list[256]={0};
+    if (sscanf(s.c_str(),"ledmap %d %255s", &nid, list)==2){
+      auto it = nodesById.find((uint8_t)nid);
+      if (it == nodesById.end()) { Serial.println("Unknown nodeId"); return; }
+
+      LedMapMsg m{}; m.h={ LED_MAP, PROTO_VER, 0,0, gSeq++, (uint16_t)sizeof(LedMapMsg) };
+      m.n = 0;
+      char *tok = strtok(list, ",");
+      while (tok && m.n < 5){
+        int pin=0, cnt=0;
+        if (sscanf(tok, "%d:%d", &pin, &cnt)==2 && pin>0 && cnt>0){
+          m.e[m.n].pin   = (uint8_t)pin;
+          m.e[m.n].count = (uint16_t)cnt;
+          m.n++;
+        }
+        tok = strtok(NULL, ",");
+      }
+      if (m.n==0){ Serial.println("usage: ledmap <nodeId> <pin:count>[,<pin:count>...]"); return; }
+
+      _enqueueTx(it->second.mac, &m, sizeof(m));  // or sendRaw
+      Serial.printf("LED_MAP sent to node=%d with %u strips\n", nid, m.n);
+    } else {
+      Serial.println("usage: ledmap <nodeId> <pin:count>[,<pin:count>...]");
     }
     return;
   }

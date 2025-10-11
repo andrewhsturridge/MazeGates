@@ -31,7 +31,7 @@
 
 // ===== Feature switches =====
 #ifndef TOF_ENABLED
-#define TOF_ENABLED 0   // temporarily disable ToF scanning
+#define TOF_ENABLED 1   // temporarily disable ToF scanning
 #endif
 
 #ifndef ACCEPT_RS5
@@ -48,48 +48,54 @@
 #define PIN_LAMP1 12
 #define PIN_LAMP2 6
 
-// ======= LED strips =======
-// L9: G34(45), G23(45), G12(45), G1(50)
-#define L9_G34 45
-#define L9_G23 45
-#define L9_G12 45
-#define L9_G1  50
-#define L9_S0  0
-#define L9_S1  (L9_G34)
-#define L9_S2  (L9_G34 + L9_G23)
-#define L9_S3  (L9_G34 + L9_G23 + L9_G12)
-#define STRIP_A_PIX (L9_G34 + L9_G23 + L9_G12 + L9_G1)   // 185
+// ---- Dynamic LED strips (up to 5) ----
+static const uint8_t MAX_STRIPS = 5;
 
-// L10: G35(45), G24(45), G13(45), G2(50)
-#define L10_G35 45
-#define L10_G24 45
-#define L10_G13 45
-#define L10_G2  50
-#define L10_S0  0
-#define L10_S1  (L10_G35)
-#define L10_S2  (L10_G35 + L10_G24)
-#define L10_S3  (L10_G35 + L10_G24 + L10_G13)
-#define STRIP_B_PIX (L10_G35 + L10_G24 + L10_G13 + L10_G2) // 185
+struct StripCfg { uint8_t pin; uint16_t count; };
+static StripCfg cfg[MAX_STRIPS];
+static uint8_t  stripCount = 0;
 
-Adafruit_NeoPixel stripA(STRIP_A_PIX, PIN_LED_STRIP_A, NEO_GRB + NEO_KHZ800);
-Adafruit_NeoPixel stripB(STRIP_B_PIX, PIN_LED_STRIP_B, NEO_GRB + NEO_KHZ800);
+static Adafruit_NeoPixel* strips[MAX_STRIPS] = {nullptr};
 
-struct GateSeg { uint8_t strip; uint16_t start; uint16_t count; };
-static bool getSegmentForGate(uint8_t gateId, GateSeg &seg) {
-  switch (gateId) {
-    // L9 (A)
-    case 34: seg = {0, L9_S0, L9_G34}; return true;
-    case 23: seg = {0, L9_S1, L9_G23}; return true;
-    case 12: seg = {0, L9_S2, L9_G12}; return true;
-    case 1:  seg = {0, L9_S3, L9_G1 }; return true;
-    // L10 (B)
-    case 35: seg = {1, L10_S0, L10_G35}; return true;
-    case 24: seg = {1, L10_S1, L10_G24}; return true;
-    case 13: seg = {1, L10_S2, L10_G13}; return true;
-    case 2:  seg = {1, L10_S3, L10_G2 }; return true;
-    default: return false;
+// NVS helpers
+static void saveStripCfg(const StripCfg* c, uint8_t n){
+  Preferences p; p.begin("maze", false);
+  p.putUChar("sN", n);
+  for (uint8_t i=0;i<MAX_STRIPS;i++){
+    char kp[8], kc[8]; snprintf(kp,8,"s%up",i); snprintf(kc,8,"s%uc",i);
+    uint8_t pin = (i < n) ? c[i].pin : 0;
+    uint16_t cnt= (i < n) ? c[i].count : 0;
+    p.putUChar(kp, pin); p.putUShort(kc, cnt);
+  }
+  p.end();
+}
+static void loadStripCfg(){
+  Preferences p; p.begin("maze", true);
+  uint8_t n = p.getUChar("sN", 0);
+  if (n==0 || n>MAX_STRIPS){
+    // Default (Node 4): 2 strips on pins 10/11, 185 px
+    stripCount = 2; cfg[0]={10,185}; cfg[1]={11,185};
+  } else {
+    stripCount = n;
+    for (uint8_t i=0;i<stripCount;i++){
+      char kp[8], kc[8]; snprintf(kp,8,"s%up",i); snprintf(kc,8,"s%uc",i);
+      cfg[i].pin   = p.getUChar(kp, 0);
+      cfg[i].count = p.getUShort(kc, 0);
+    }
+  }
+  p.end();
+}
+static void applyStripCfg(){
+  for (uint8_t i=0;i<MAX_STRIPS;i++){ if (strips[i]){ delete strips[i]; strips[i]=nullptr; } }
+  for (uint8_t i=0;i<stripCount;i++){
+    if (cfg[i].pin && cfg[i].count){
+      strips[i] = new Adafruit_NeoPixel(cfg[i].count, cfg[i].pin, NEO_GRB + NEO_KHZ800);
+      strips[i]->begin(); strips[i]->clear(); strips[i]->show();
+    }
   }
 }
+
+struct GateSeg { uint8_t strip; uint16_t start; uint16_t count; };
 
 // Node 4 TCA mapping (from CSV)
 static uint8_t kGateByTcaPort[8] = {
@@ -146,7 +152,7 @@ static volatile bool gHelloPending = false, gStatusPending = false;
 static uint32_t helloDueAt = 0, statusDueAt = 0;
 
 // ======= Protocol =======
-enum MsgType : uint8_t { HELLO=1, HELLO_REQ=2, CLAIM=3, GATE_EVENT=10, LED_RANGE=20, LAMP_CTRL=21, BUTTON_EVENT=30, OTA_START=50, OTA_ACK=51, NODE_STATUS = 60 };
+enum MsgType : uint8_t { HELLO=1, HELLO_REQ=2, CLAIM=3, GATE_EVENT=10, LED_RANGE=20, LAMP_CTRL=21, BUTTON_EVENT=30, OTA_START=50, OTA_ACK=51, NODE_STATUS = 60, LED_MAP = 62 };
 struct __attribute__((packed)) PktHeader { uint8_t type, version, nodeId, pad; uint16_t seq, len; };
 static const uint8_t PROTO_VER = 1;
 
@@ -159,6 +165,11 @@ struct __attribute__((packed)) LampCtrlMsg { PktHeader h; uint8_t idx; uint8_t o
 struct __attribute__((packed)) OtaStartMsg { PktHeader h; char url[200]; };
 struct __attribute__((packed)) OtaAckMsg { PktHeader h; uint8_t status; /*0=starting*/ };
 struct __attribute__((packed)) NodeStatusMsg { PktHeader h; uint32_t uptimeMs; uint8_t  initedMask; uint8_t  errStreakMax; uint8_t  reinitCount[8]; };
+struct __attribute__((packed)) LedMapMsg {
+  PktHeader h;
+  uint8_t n;
+  struct { uint8_t pin; uint16_t count; } e[5];
+};
 
 // ======= ESP‑NOW =======
 static volatile bool gOtaPending = false;
@@ -223,22 +234,15 @@ static void onNowRecv(const esp_now_recv_info* info, const uint8_t* data, int le
     sendHello();
     return;
   }
-  // LED paint (solid for now) — no show() here; render() will push frames
+  // LED_RANGE (solid fill) — dynamic strips, clamp to configured lengths
   if (h->type == LED_RANGE && len >= (int)sizeof(LedRangeMsg)) {
     auto *m = (const LedRangeMsg*)data;
-
-    if (m->strip == 0) {
+    if (m->strip < stripCount && strips[m->strip]) {
       uint16_t end = m->start + m->count;
-      if (end > STRIP_A_PIX) end = STRIP_A_PIX;
-      for (uint16_t i = m->start; i < end; ++i) {
-        stripA.setPixelColor(i, stripA.Color(m->r, m->g, m->b));
-      }
-    } else if (m->strip == 1) {
-      uint16_t end = m->start + m->count;
-      if (end > STRIP_B_PIX) end = STRIP_B_PIX;
-      for (uint16_t i = m->start; i < end; ++i) {
-        stripB.setPixelColor(i, stripB.Color(m->r, m->g, m->b));
-      }
+      uint16_t cap = cfg[m->strip].count;
+      if (end > cap) end = cap;
+      for (uint16_t i = m->start; i < end; ++i)
+        strips[m->strip]->setPixelColor(i, strips[m->strip]->Color(m->r, m->g, m->b));
     }
     return;
   }
@@ -248,7 +252,25 @@ static void onNowRecv(const esp_now_recv_info* info, const uint8_t* data, int le
     auto *m=(const LampCtrlMsg*)data; if (m->idx==1) digitalWrite(PIN_LAMP1, m->on?HIGH:LOW); else if (m->idx==2) digitalWrite(PIN_LAMP2, m->on?HIGH:LOW);
     return;
   }
-  // OTA
+
+  // LED_MAP from server -> store & reboot to apply
+  if (h->type == LED_MAP && len >= (int)sizeof(PktHeader)+1) {
+    const LedMapMsg* m = (const LedMapMsg*)data;
+    uint8_t n = m->n; if (n > MAX_STRIPS) n = MAX_STRIPS;
+    StripCfg tmp[MAX_STRIPS] = {};
+    for (uint8_t i=0; i<n; ++i){
+      uint8_t pin = m->e[i].pin; uint16_t cnt = m->e[i].count;
+      if (cnt > 600) cnt = 600;                   // sanity
+      if (cnt == 0 || pin == 0) { n = i; break; } // stop at first invalid
+      tmp[i] = { pin, cnt };
+    }
+    saveStripCfg(tmp, n);
+    Serial.printf("[LED_MAP] saved %u strips; rebooting\n", n);
+    delay(100); ESP.restart();
+    return;
+  }
+
+    // OTA
   if (h->type==OTA_START && len >= (int)sizeof(PktHeader)) {
     String url="";
     if (len > (int)sizeof(PktHeader)){
@@ -269,38 +291,64 @@ static String loadWifiSsid(){ prefs.begin("maze", true); String s=prefs.getStrin
 static String loadWifiPass(){ prefs.begin("maze", true); String s=prefs.getString("ota_pass",""); prefs.end(); return s; }
 static void saveWifiCreds(const String& ssid,const String& pass){ prefs.begin("maze", false); prefs.putString("ota_ssid",ssid); prefs.putString("ota_pass",pass); prefs.end(); }
 
+// ---- OTA visuals: dynamic across all configured strips ----
 static void drawOtaProgress(size_t done, size_t total){
-  float f = total? (float)done/(float)total : 0.f;
-  uint32_t totalPix = STRIP_A_PIX + STRIP_B_PIX;
+  float f = total ? (float)done/(float)total : 0.f;
+
+  // total pixels across configured strips
+  uint32_t totalPix = 0;
+  for (uint8_t i=0;i<stripCount;i++) totalPix += cfg[i].count;
+  if (totalPix == 0) return;
+
   uint32_t lit = (uint32_t)(f * totalPix + 0.5f);
-  for (uint16_t i=0;i<STRIP_A_PIX;i++) stripA.setPixelColor(i, 0);
-  for (uint16_t i=0;i<STRIP_B_PIX;i++) stripB.setPixelColor(i, 0);
-  uint32_t col = stripA.Color(0, 150, 0);
-  // Fill A first
-  uint32_t fillA = (lit <= STRIP_A_PIX) ? lit : STRIP_A_PIX;
-  for (uint16_t i=0;i<fillA;i++) stripA.setPixelColor(i, col);
-  // Remaining to B
-  if (lit > STRIP_A_PIX){
-    uint32_t left = lit-STRIP_A_PIX;
-    uint32_t fillB = (left <= STRIP_B_PIX) ? left : STRIP_B_PIX;
-    for (uint16_t i=0;i<fillB;i++) stripB.setPixelColor(i, col);
+
+  // clear all
+  for (uint8_t i=0;i<stripCount;i++){
+    if (!strips[i]) continue;
+    for (uint16_t p=0;p<cfg[i].count;p++) strips[i]->setPixelColor(p, 0);
   }
-  stripA.show(); stripB.show();
+
+  // fill across strips in order
+  uint32_t rem = lit;
+  for (uint8_t i=0;i<stripCount && rem>0;i++){
+    if (!strips[i]) continue;
+    uint32_t seg = (rem > cfg[i].count) ? cfg[i].count : rem;
+    for (uint16_t p=0;p<seg;p++)
+      strips[i]->setPixelColor(p, strips[i]->Color(0,150,0));
+    rem -= seg;
+  }
+
+  for (uint8_t i=0;i<stripCount;i++) if (strips[i]) strips[i]->show();
 }
+
 static void showOtaError(){
-  for(int k=0;k<3;k++){
-    for(uint16_t i=0;i<STRIP_A_PIX;i++) stripA.setPixelColor(i, stripA.Color(150,0,0));
-    for(uint16_t i=0;i<STRIP_B_PIX;i++) stripB.setPixelColor(i, stripB.Color(150,0,0));
-    stripA.show(); stripB.show(); delay(150);
-    for(uint16_t i=0;i<STRIP_A_PIX;i++) stripA.setPixelColor(i, 0);
-    for(uint16_t i=0;i<STRIP_B_PIX;i++) stripB.setPixelColor(i, 0);
-    stripA.show(); stripB.show(); delay(150);
+  for (int k=0;k<3;k++){
+    // red on
+    for (uint8_t i=0;i<stripCount;i++){
+      if (!strips[i]) continue;
+      for (uint16_t p=0;p<cfg[i].count;p++)
+        strips[i]->setPixelColor(p, strips[i]->Color(150,0,0));
+      strips[i]->show();
+    }
+    delay(150);
+    // clear
+    for (uint8_t i=0;i<stripCount;i++){
+      if (!strips[i]) continue;
+      for (uint16_t p=0;p<cfg[i].count;p++)
+        strips[i]->setPixelColor(p, 0);
+      strips[i]->show();
+    }
+    delay(150);
   }
 }
+
 static void showOtaSuccess(){
-  for(uint16_t i=0;i<STRIP_A_PIX;i++) stripA.setPixelColor(i, stripA.Color(0,150,0));
-  for(uint16_t i=0;i<STRIP_B_PIX;i++) stripB.setPixelColor(i, stripB.Color(0,150,0));
-  stripA.show(); stripB.show();
+  for (uint8_t i=0;i<stripCount;i++){
+    if (!strips[i]) continue;
+    for (uint16_t p=0;p<cfg[i].count;p++)
+      strips[i]->setPixelColor(p, strips[i]->Color(0,150,0));
+    strips[i]->show();
+  }
 }
 
 static void stopEspNow(){ esp_now_deinit(); }
@@ -368,9 +416,17 @@ static bool reinitChannel(uint8_t ch) {
 }
 
 // ======= Render scheduling =======
-static const uint32_t RENDER_MS = 33; // ~30 fps
-static uint32_t lastRender=0; static bool i2cBusy=false;
-static void render(){ if (millis()-lastRender < RENDER_MS) return; if (i2cBusy) return; lastRender=millis(); stripA.show(); stripB.show(); }
+static const uint32_t RENDER_MS = 33;
+static uint32_t lastRender=0;
+static bool i2cBusy=false;
+
+static void render(){
+  if (millis()-lastRender < RENDER_MS) return;
+  if (i2cBusy) return;
+  lastRender = millis();
+  for (uint8_t i=0;i<stripCount;i++)
+    if (strips[i]) strips[i]->show();
+}
 
 // ======= Buttons & Lamps =======
 struct Btn { uint8_t pin; bool last; uint32_t lastEdge; };
@@ -475,7 +531,8 @@ void setup(){
   pinMode(PIN_LAMP1, OUTPUT); pinMode(PIN_LAMP2, OUTPUT);
   digitalWrite(PIN_LAMP1, LOW); digitalWrite(PIN_LAMP2, LOW);
 
-  stripA.begin(); stripB.begin(); stripA.clear(); stripB.clear(); stripA.show(); stripB.show();
+  loadStripCfg();
+  applyStripCfg();
 
   Wire.begin(PIN_SDA, PIN_SCL);
   Wire.setClock(200000);   // 200 kHz like the test sketch
