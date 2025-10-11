@@ -198,17 +198,48 @@ static bool walkable[GATE_MAX+1]; // 1..44 used
 static inline void clearWalkable(){ memset(walkable, 0, sizeof(walkable)); }
 static inline void addWalkableGate(uint8_t g){ if (g>=1 && g<=GATE_MAX) walkable[g] = true; }
 static inline bool isWalkable(uint8_t g){ return (g>=1 && g<=GATE_MAX) ? walkable[g] : false; }
-// Node4-only for now; file-scope function (NOT inside handleCli)
+// Full-field pushWalkable(): base-coat per (node,strip) then overlay greens
 static void pushWalkable(){
-  for (uint8_t g = 1; g <= GATE_MAX; ++g){
-    uint8_t strip; 
-    uint16_t start; 
-    if (!routeGateToNode4(g, strip, start)) continue; // Node4-only routing
+  // 1) Scan the GATE_MAP to figure out max length per (node,strip)
+  // Limits: nodeId in [0..7], strip in [0..7] (small fixed arrays keep it simple)
+  uint16_t maxLen[8][8];    // max pixel (end) per (node,strip)
+  bool     seenStrip[8][8]; // did we see any gate on (node,strip)?
+  bool     seenNode[8];     // node has at least one strip
 
-    uint16_t count = (g==1 || g==2) ? 50 : 45;        // mixed 45/50
-    uint8_t r  = walkable[g] ? 0   : 150;
-    uint8_t gr = walkable[g] ? 150 : 0;
-    sendLedRange(/*nodeId*/4, strip, start, count, r, gr, 0);
+  // init
+  for (int n=0; n<8; ++n){ seenNode[n]=false; for (int s=0; s<8; ++s){ maxLen[n][s]=0; seenStrip[n][s]=false; }}
+
+  // pass 1: compute maxLen and seen sets
+  for (uint8_t g=1; g<=44; ++g){
+    const GateMapEntry &e = GATE_MAP[g];
+    if (e.nodeId == 0) continue;                  // unmapped
+    if (e.strip   > 7) continue;
+    uint16_t end = e.start + e.count;
+    if (end > maxLen[e.nodeId][e.strip]) maxLen[e.nodeId][e.strip] = end;
+    seenStrip[e.nodeId][e.strip] = true;
+    seenNode[e.nodeId] = true;
+  }
+
+  // 2) Base coat: for every seen (node,strip), paint full red
+  for (uint8_t n=0; n<8; ++n){
+    if (!seenNode[n]) continue;
+    for (uint8_t s=0; s<8; ++s){
+      if (!seenStrip[n][s]) continue;
+      uint16_t count = maxLen[n][s];
+      if (count == 0) continue;
+      // red baseline
+      sendLedRange(n, s, 0, count, 150, 0, 0);
+    }
+  }
+
+  // 3) Overlays: for each gate, overlay green if walkable (else red is already there)
+  for (uint8_t g=1; g<=44; ++g){
+    const GateMapEntry &e = GATE_MAP[g];
+    if (e.nodeId == 0) continue;
+    const bool ok = walkable[g];
+    const uint8_t r = ok ? 0 : 150;
+    const uint8_t gr = ok ? 150 : 0;
+    sendLedRange(e.nodeId, e.strip, e.start, e.count, r, gr, 0);
   }
 }
 
@@ -302,7 +333,7 @@ struct TxItem {
 static TxItem txQ[64];
 static volatile uint8_t qHead = 0, qTail = 0;
 static uint32_t lastTxMs = 0;
-static const uint16_t DRIP_MS = 3;    // 3ms spacing (tune 2–5ms)
+static const uint16_t DRIP_MS = 5;    // 3ms spacing (tune 2–5ms)
 
 // Enqueue a raw frame (drop oldest if full)
 static void _enqueueTx(const uint8_t mac[6], const void* data, uint8_t len){
@@ -431,4 +462,7 @@ static void handleCli(String s){
   }
 }
 
-void loop(){ if (Serial.available()){ String s=Serial.readStringUntil('\n'); handleCli(s); dripPump(); } }
+void loop(){
+  dripPump();
+  if (Serial.available()){ String s=Serial.readStringUntil('\n'); handleCli(s); }
+}

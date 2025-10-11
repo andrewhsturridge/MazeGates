@@ -31,7 +31,7 @@
 
 // ===== Feature switches =====
 #ifndef TOF_ENABLED
-#define TOF_ENABLED 1   // temporarily disable ToF scanning
+#define TOF_ENABLED 0   // temporarily disable ToF scanning
 #endif
 
 #ifndef ACCEPT_RS5
