@@ -2,11 +2,11 @@
  * Maze Gates – Node 4 Foundation v0 (clean compile, no serial CLI)
  * Board: Unexpected Maker FeatherS3 (ESP32‑S3)
  * Transport: ESP‑NOW ch.6 (OTA .bin supported; no maintenance/long‑press)
- * Sensors: 8× VL53L4CX via TCA9548A @ 0x70 (temporarily disabled)
+ * Sensors: 8× VL53L4CX via TCA9548A @ 0x70
  * LEDs: L9@GPIO10 (G34,G23,G12,G1), L10@GPIO11 (G35,G24,G13,G2)
  * Buttons: B1=GPIO17, B2=GPIO18  (INPUT_PULLUP)
  * Lamps (MOSFET, 5V): LAMP1=GPIO12, LAMP2=GPIO6
- * I2C: SDA=8, SCL=9, 100 kHz
+ * I2C: SDA=8, SCL=9, 200 kHz
  */
 
 #include <Arduino.h>
@@ -31,7 +31,11 @@
 
 // ===== Feature switches =====
 #ifndef TOF_ENABLED
-#define TOF_ENABLED 0   // temporarily disable ToF scanning
+#define TOF_ENABLED 1   // temporarily disable ToF scanning
+#endif
+
+#ifndef ACCEPT_RS5
+#define ACCEPT_RS5 0    // set to 1 later if you need to accept RangeStatus 5
 #endif
 
 // ======= Pins =======
@@ -45,25 +49,44 @@
 #define PIN_LAMP2 6
 
 // ======= LED strips =======
-#define PIXELS_PER_GATE 50
-#define STRIP_A_PIX (4 * PIXELS_PER_GATE) // G34,G23,G12,G1
-#define STRIP_B_PIX (4 * PIXELS_PER_GATE) // G35,G24,G13,G2
+// L9: G34(45), G23(45), G12(45), G1(50)
+#define L9_G34 45
+#define L9_G23 45
+#define L9_G12 45
+#define L9_G1  50
+#define L9_S0  0
+#define L9_S1  (L9_G34)
+#define L9_S2  (L9_G34 + L9_G23)
+#define L9_S3  (L9_G34 + L9_G23 + L9_G12)
+#define STRIP_A_PIX (L9_G34 + L9_G23 + L9_G12 + L9_G1)   // 185
+
+// L10: G35(45), G24(45), G13(45), G2(50)
+#define L10_G35 45
+#define L10_G24 45
+#define L10_G13 45
+#define L10_G2  50
+#define L10_S0  0
+#define L10_S1  (L10_G35)
+#define L10_S2  (L10_G35 + L10_G24)
+#define L10_S3  (L10_G35 + L10_G24 + L10_G13)
+#define STRIP_B_PIX (L10_G35 + L10_G24 + L10_G13 + L10_G2) // 185
+
 Adafruit_NeoPixel stripA(STRIP_A_PIX, PIN_LED_STRIP_A, NEO_GRB + NEO_KHZ800);
 Adafruit_NeoPixel stripB(STRIP_B_PIX, PIN_LED_STRIP_B, NEO_GRB + NEO_KHZ800);
 
 struct GateSeg { uint8_t strip; uint16_t start; uint16_t count; };
 static bool getSegmentForGate(uint8_t gateId, GateSeg &seg) {
   switch (gateId) {
-    // L9 (A): pixel0 → G34, G23, G12, G1
-    case 34: seg = {0, 0 * PIXELS_PER_GATE, PIXELS_PER_GATE}; return true;
-    case 23: seg = {0, 1 * PIXELS_PER_GATE, PIXELS_PER_GATE}; return true;
-    case 12: seg = {0, 2 * PIXELS_PER_GATE, PIXELS_PER_GATE}; return true;
-    case 1:  seg = {0, 3 * PIXELS_PER_GATE, PIXELS_PER_GATE}; return true;
-    // L10 (B): pixel0 → G35, G24, G13, G2
-    case 35: seg = {1, 0 * PIXELS_PER_GATE, PIXELS_PER_GATE}; return true;
-    case 24: seg = {1, 1 * PIXELS_PER_GATE, PIXELS_PER_GATE}; return true;
-    case 13: seg = {1, 2 * PIXELS_PER_GATE, PIXELS_PER_GATE}; return true;
-    case 2:  seg = {1, 3 * PIXELS_PER_GATE, PIXELS_PER_GATE}; return true;
+    // L9 (A)
+    case 34: seg = {0, L9_S0, L9_G34}; return true;
+    case 23: seg = {0, L9_S1, L9_G23}; return true;
+    case 12: seg = {0, L9_S2, L9_G12}; return true;
+    case 1:  seg = {0, L9_S3, L9_G1 }; return true;
+    // L10 (B)
+    case 35: seg = {1, L10_S0, L10_G35}; return true;
+    case 24: seg = {1, L10_S1, L10_G24}; return true;
+    case 13: seg = {1, L10_S2, L10_G13}; return true;
+    case 2:  seg = {1, L10_S3, L10_G2 }; return true;
     default: return false;
   }
 }
@@ -121,13 +144,26 @@ static void onNowRecv(const esp_now_recv_info* info, const uint8_t* data, int le
     sendHello();
     return;
   }
-  // LED paint (solid for now)
-  if (h->type==LED_RANGE && len >= (int)sizeof(LedRangeMsg)) {
-    auto *m=(const LedRangeMsg*)data;
-    if (m->strip==0) { for (uint16_t i=0; i<m->count; ++i) stripA.setPixelColor(m->start+i, stripA.Color(m->r,m->g,m->b)); }
-    else if (m->strip==1) { for (uint16_t i=0; i<m->count; ++i) stripB.setPixelColor(m->start+i, stripB.Color(m->r,m->g,m->b)); }
+  // LED paint (solid for now) — no show() here; render() will push frames
+  if (h->type == LED_RANGE && len >= (int)sizeof(LedRangeMsg)) {
+    auto *m = (const LedRangeMsg*)data;
+
+    if (m->strip == 0) {
+      uint16_t end = m->start + m->count;
+      if (end > STRIP_A_PIX) end = STRIP_A_PIX;
+      for (uint16_t i = m->start; i < end; ++i) {
+        stripA.setPixelColor(i, stripA.Color(m->r, m->g, m->b));
+      }
+    } else if (m->strip == 1) {
+      uint16_t end = m->start + m->count;
+      if (end > STRIP_B_PIX) end = STRIP_B_PIX;
+      for (uint16_t i = m->start; i < end; ++i) {
+        stripB.setPixelColor(i, stripB.Color(m->r, m->g, m->b));
+      }
+    }
     return;
   }
+
   // Lamps
   if (h->type==LAMP_CTRL && len >= (int)sizeof(LampCtrlMsg)) {
     auto *m=(const LampCtrlMsg*)data; if (m->idx==1) digitalWrite(PIN_LAMP1, m->on?HIGH:LOW); else if (m->idx==2) digitalWrite(PIN_LAMP2, m->on?HIGH:LOW);
@@ -222,13 +258,31 @@ static void performHttpOta(String url, String ssid, String pass){
 
 // ======= TCA9548A helpers =======
 #define TCA_ADDR 0x70
-static void tcaSelect(uint8_t ch){ Wire.beginTransmission(TCA_ADDR); Wire.write(1<<ch); Wire.endTransmission(); delayMicroseconds(200); }
+static inline bool tcaSelect(uint8_t ch) {
+  if (ch > 7) return false;
+  Wire.beginTransmission(TCA_ADDR);
+  Wire.write(1 << ch);
+  bool ok = (Wire.endTransmission() == 0);
+  if (ok) delay(5);  // allow settle after switching
+  return ok;
+}
 static void tcaOff(){ Wire.beginTransmission(TCA_ADDR); Wire.write(0); Wire.endTransmission(); }
 
-// ======= VL53L4CX =======
-static VL53L4CX vl(&Wire, 0x52); // ST uses 0x52 (7‑bit 0x29 << 1)
+// ======= VL53L4CX (8 sensors, test-style) =======
+#define DEV_I2C Wire
+#define NUM_SENSORS 8
 
-// Node 4 TCA mapping (from CSV)
+VL53L4CX tof0(&DEV_I2C, 255);
+VL53L4CX tof1(&DEV_I2C, 255);
+VL53L4CX tof2(&DEV_I2C, 255);
+VL53L4CX tof3(&DEV_I2C, 255);
+VL53L4CX tof4(&DEV_I2C, 255);
+VL53L4CX tof5(&DEV_I2C, 255);
+VL53L4CX tof6(&DEV_I2C, 255);
+VL53L4CX tof7(&DEV_I2C, 255);
+VL53L4CX* TOF[NUM_SENSORS] = { &tof0, &tof1, &tof2, &tof3, &tof4, &tof5, &tof6, &tof7 };
+
+// Node 4 TCA mapping (from CSV)  //  <-- place this BEFORE sampleCh and reinitChannel
 static uint8_t kGateByTcaPort[8] = {
   /*ch0 (port1)*/ 23,
   /*ch1 (port2)*/ 24,
@@ -240,6 +294,20 @@ static uint8_t kGateByTcaPort[8] = {
   /*ch7 (port8)*/ 40
 };
 
+// TCA channels (0..7) — already implied by your mapping; keep as-is
+// kGateByTcaPort[] is your gate mapping; channels are the same 0..7
+
+// Per-channel init/error state (test-style)
+static bool      inited[NUM_SENSORS] = {0};
+static uint8_t   errStreak[NUM_SENSORS] = {0};
+static unsigned long lastPollMs[NUM_SENSORS] = {0};
+static const uint8_t  MAX_ERR_BEFORE_REINIT = 4;
+
+// Strict window (test behavior)
+static const uint16_t MIN_MM = 600;
+static const uint16_t MAX_MM = 2000;
+// (match test: no signal floor — add back later if you want)
+
 // Detection params
 static const uint16_t ABS_THRESH_MM = 1500; // fallback absolute
 static const uint16_t DELTA_THRESH_MM = 600; // baseline‑delta
@@ -248,6 +316,26 @@ static const uint16_t REARM_MS = 500;
 
 struct GateDet { bool present=false; uint8_t hits=0; uint32_t rearmUntil=0; uint16_t baseline=2000; };
 static GateDet det[8]; // by TCA port
+
+static uint32_t lastReinitScanMs = 0;
+
+// Light re-init for a single channel if it starts erroring (test-style)
+static bool reinitChannel(uint8_t ch) {
+  if (!tcaSelect(ch)) return false;
+  delay(5);
+
+  TOF[ch]->begin();
+  // Test sketch uses 0x12 here; we’ll match it exactly for parity
+  VL53L4CX_Error st = TOF[ch]->InitSensor(0x12);
+  if (st) { tcaOff(); return false; }
+  st = TOF[ch]->VL53L4CX_StartMeasurement();
+  tcaOff();
+  if (st) return false;
+
+  errStreak[ch] = 0;
+  inited[ch] = true;
+  return true;
+}
 
 // ======= Render scheduling =======
 static const uint32_t RENDER_MS = 33; // ~30 fps
@@ -268,16 +356,99 @@ static void pollButtons(){
   }
 }
 
+// Sample one channel – strict window (600–2000 mm) + 60 ms throttle + light re-init
+static void sampleCh(uint8_t ch){
+  if (kGateByTcaPort[ch] == 0) return;   // no gate on this channel
+  if (!inited[ch]) return;               // channel not initialized
+
+  // Per-channel throttle
+  unsigned long now = millis();
+  if (now - lastPollMs[ch] < 60) return;
+  lastPollMs[ch] = now;
+
+  i2cBusy = true;
+  if (!tcaSelect(ch)) {                  // TCA select failed
+    i2cBusy = false;
+    if (++errStreak[ch] >= MAX_ERR_BEFORE_REINIT) reinitChannel(ch);
+    return;
+  }
+
+  // Ready?
+  uint8_t ready = 0;
+  if (TOF[ch]->VL53L4CX_GetMeasurementDataReady(&ready) != 0) {
+    i2cBusy = false; tcaOff();
+    if (++errStreak[ch] >= MAX_ERR_BEFORE_REINIT) reinitChannel(ch);
+    return;
+  }
+  if (!ready) {
+    i2cBusy = false; tcaOff();
+    return;
+  }
+
+  // Read measurement
+  VL53L4CX_MultiRangingData_t R{};
+  if (TOF[ch]->VL53L4CX_GetMultiRangingData(&R) != 0) {
+    i2cBusy = false; tcaOff();
+    if (++errStreak[ch] >= MAX_ERR_BEFORE_REINIT) reinitChannel(ch);
+    return;
+  }
+
+  // First valid object in window (optional RS5 support)
+  bool     valid = false;
+  uint16_t mm    = 8191;
+  if (R.NumberOfObjectsFound > 0) {
+    for (int j = 0; j < R.NumberOfObjectsFound; ++j) {
+      const uint8_t  rs = R.RangeData[j].RangeStatus;
+      const uint16_t m  = R.RangeData[j].RangeMilliMeter;
+#if ACCEPT_RS5
+      if ((rs == 0 || rs == 5) && m >= MIN_MM && m <= MAX_MM) { valid = true; mm = m; break; }
+#else
+      if (rs == 0 && m >= MIN_MM && m <= MAX_MM) { valid = true; mm = m; break; }
+#endif
+    }
+  }
+
+  TOF[ch]->VL53L4CX_ClearInterruptAndStartMeasurement();
+  tcaOff(); i2cBusy = false;
+  errStreak[ch] = 0;                     // any successful transaction clears error streak
+
+  // Debounce strictly on valid in-window samples
+  auto &d = det[ch];
+  if (valid) { if (d.hits < 255) d.hits++; } else { if (d.hits > 0) d.hits--; }
+  const bool cand = (d.hits >= DEBOUNCE);
+
+  // Re-arm blocks new ENTERs, but doesn’t force EXITs
+  if (!d.present) {
+    if (cand && millis() >= d.rearmUntil) {
+      d.present = true;
+      d.rearmUntil = millis() + REARM_MS;
+      const uint8_t gate = kGateByTcaPort[ch];
+      sendGateEvent(gate, /*ENTER*/ 1, mm);
+    }
+  } else {
+    if (!cand) {
+      d.present = false;
+      const uint8_t gate = kGateByTcaPort[ch];
+      sendGateEvent(gate, /*EXIT*/  2, mm);
+    }
+  }
+}
+
 // ======= Setup =======
 void setup(){
   Serial.begin(115200);
+  delay(150);           // allow sensors/mux to finish their own boot after a soft reset
+
   pinMode(PIN_BTN1, INPUT_PULLUP); pinMode(PIN_BTN2, INPUT_PULLUP);
   pinMode(PIN_LAMP1, OUTPUT); pinMode(PIN_LAMP2, OUTPUT);
   digitalWrite(PIN_LAMP1, LOW); digitalWrite(PIN_LAMP2, LOW);
 
   stripA.begin(); stripB.begin(); stripA.clear(); stripB.clear(); stripA.show(); stripB.show();
 
-  Wire.begin(PIN_SDA,PIN_SCL,100000);
+  Wire.begin(PIN_SDA, PIN_SCL);
+  Wire.setClock(200000);   // 200 kHz like the test sketch
+  // Optional: give sensors/mux a brief boot settle (improves first-boot reliability)
+  delay(150);
 
   // ESP‑NOW init
   WiFi.mode(WIFI_STA); esp_wifi_set_channel(6, WIFI_SECOND_CHAN_NONE);
@@ -289,49 +460,27 @@ void setup(){
   prefs.begin("maze", false); gNodeId = prefs.getUChar("nodeId", 4); prefs.end();
   sendHello();
 
+  tcaOff();             // start with all channels off (clean mux state)
+
 #if TOF_ENABLED
-  // VL53 init on each active channel
   for (uint8_t ch=0; ch<8; ch++){
-    if (kGateByTcaPort[ch]==0) continue; // unused channel
-    tcaSelect(ch);
-    if (vl.begin()!=0) { Serial.printf("[VL] ch%u begin failed", ch); Serial.println(); continue; }
-    vl.InitSensor(0x52);
-    vl.VL53L4CX_SetDistanceMode(VL53L4CX_DISTANCEMODE_LONG);
-    vl.VL53L4CX_SetMeasurementTimingBudgetMicroSeconds(33000); // 33 ms
-    vl.VL53L4CX_StartMeasurement();
+    if (kGateByTcaPort[ch]==0) continue;   // skip unused channels
+    if (!tcaSelect(ch)) {
+      Serial.printf("[TCA] Channel select failed during init (ch %u)\n", ch);
+      continue;
+    }
+    delay(5);
+    TOF[ch]->begin();
+    VL53L4CX_Error st = TOF[ch]->InitSensor(0x12);  // test uses 0x12
+    if (st) { Serial.printf("[VL53] Init failed ch %u (err=%d)\n", ch, (int)st); continue; }
+    st = TOF[ch]->VL53L4CX_StartMeasurement();
+    if (st) { Serial.printf("[VL53] StartMeasurement failed ch %u (err=%d)\n", ch, (int)st); continue; }
+    inited[ch] = true; errStreak[ch] = 0;
+    Serial.printf("[VL53] READY ch %u\n", ch);
   }
   tcaOff();
 #endif
-}
 
-// Sample one channel
-static void sampleCh(uint8_t ch){
-  if (kGateByTcaPort[ch]==0) return;
-  i2cBusy=true; tcaSelect(ch);
-  uint8_t ready=0; if (vl.VL53L4CX_GetMeasurementDataReady(&ready)!=0){ i2cBusy=false; return; }
-  if (!ready){ i2cBusy=false; return; }
-  VL53L4CX_MultiRangingData_t R{}; if (vl.VL53L4CX_GetMultiRangingData(&R)!=0){ i2cBusy=false; return; }
-  uint16_t mm = (R.NumberOfObjectsFound > 0) ? R.RangeData[0].RangeMilliMeter : 8191;
-  vl.VL53L4CX_ClearInterruptAndStartMeasurement();
-  tcaOff(); i2cBusy=false;
-
-  // Baseline & detect
-  auto &d = det[ch]; if (d.baseline<500 || d.baseline>4000) d.baseline = mm; // init
-  uint16_t drop = (d.baseline>mm)? (d.baseline-mm):0;
-  bool occ = (mm<ABS_THRESH_MM) || (drop>DELTA_THRESH_MM);
-  if (millis()<d.rearmUntil) occ=false; // rearm window
-
-  if (occ){ if (d.hits<255) d.hits++; } else if (d.hits>0) d.hits--; // debounce counter
-
-  bool nowPresent = (d.hits>=DEBOUNCE);
-  if (nowPresent && !d.present){
-    d.present=true; d.rearmUntil = millis()+REARM_MS; // ENTER
-    uint8_t gate = kGateByTcaPort[ch]; sendGateEvent(gate, /*ENTER*/1, mm);
-  } else if (!nowPresent && d.present){
-    d.present=false; // EXIT
-    uint8_t gate = kGateByTcaPort[ch]; sendGateEvent(gate, /*EXIT*/2, mm);
-  }
-  if (!nowPresent) d.baseline = (uint16_t)(0.9f*d.baseline + 0.1f*mm);
 }
 
 void loop(){
@@ -346,5 +495,14 @@ void loop(){
     gOtaPending = false;
     String url = (gOtaUrlBuf[0] ? String(gOtaUrlBuf) : String());
     performHttpOta(url, String(), String());
+  }
+
+  // Background re-init scan every 2s (one channel per pass)
+  if (millis() - lastReinitScanMs > 2000) {
+    lastReinitScanMs = millis();
+    for (uint8_t ch=0; ch<8; ++ch) {
+      if (kGateByTcaPort[ch] == 0) continue;
+      if (!inited[ch]) { reinitChannel(ch); break; }  // try one per scan
+    }
   }
 }
