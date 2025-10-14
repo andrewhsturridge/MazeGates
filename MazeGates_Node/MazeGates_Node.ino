@@ -152,7 +152,7 @@ static volatile bool gHelloPending = false, gStatusPending = false;
 static uint32_t helloDueAt = 0, statusDueAt = 0;
 
 // ======= Protocol =======
-enum MsgType : uint8_t { HELLO=1, HELLO_REQ=2, CLAIM=3, GATE_EVENT=10, LED_RANGE=20, LAMP_CTRL=21, BUTTON_EVENT=30, OTA_START=50, OTA_ACK=51, NODE_STATUS = 60, LED_MAP = 62 };
+enum MsgType : uint8_t { HELLO=1, HELLO_REQ=2, CLAIM=3, GATE_EVENT=10, LED_RANGE=20, LAMP_CTRL=21, BUTTON_EVENT=30, OTA_START=50, OTA_ACK=51, NODE_STATUS = 60, LED_MAP = 62, LED_MAP_REQ = 63, LED_MAP_RSP = 64 };
 struct __attribute__((packed)) PktHeader { uint8_t type, version, nodeId, pad; uint16_t seq, len; };
 static const uint8_t PROTO_VER = 1;
 
@@ -166,6 +166,12 @@ struct __attribute__((packed)) OtaStartMsg { PktHeader h; char url[200]; };
 struct __attribute__((packed)) OtaAckMsg { PktHeader h; uint8_t status; /*0=starting*/ };
 struct __attribute__((packed)) NodeStatusMsg { PktHeader h; uint32_t uptimeMs; uint8_t  initedMask; uint8_t  errStreakMax; uint8_t  reinitCount[8]; };
 struct __attribute__((packed)) LedMapMsg {
+  PktHeader h;
+  uint8_t n;
+  struct { uint8_t pin; uint16_t count; } e[5];
+};
+// response payload (mirrors your dynamic cfg)
+struct __attribute__((packed)) LedMapRsp {
   PktHeader h;
   uint8_t n;
   struct { uint8_t pin; uint16_t count; } e[5];
@@ -267,6 +273,20 @@ static void onNowRecv(const esp_now_recv_info* info, const uint8_t* data, int le
     saveStripCfg(tmp, n);
     Serial.printf("[LED_MAP] saved %u strips; rebooting\n", n);
     delay(100); ESP.restart();
+    return;
+  }
+
+  // LED_MAP_REQ -> reply with current pins/counts (LED_MAP_RSP)
+  if (h->type == LED_MAP_REQ && len >= (int)sizeof(PktHeader)) {
+    LedMapRsp r{};
+    r.h = { LED_MAP_RSP, PROTO_VER, gNodeId, 0, gSeq++, (uint16_t)sizeof(LedMapRsp) };
+    r.n = stripCount;
+    for (uint8_t i=0; i<stripCount && i<5; ++i) {
+      r.e[i].pin   = cfg[i].pin;
+      r.e[i].count = cfg[i].count;
+    }
+    // broadcast is fine; server will parse nodeId from header
+    sendRaw(kBroadcast, (uint8_t*)&r, sizeof(r));
     return;
   }
 
