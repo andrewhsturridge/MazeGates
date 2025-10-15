@@ -194,7 +194,40 @@ Preferences prefs;
 static uint8_t gNodeId=0;
 static uint8_t kBroadcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 
-static void sendRaw(const uint8_t* mac, const uint8_t* data, size_t len){ esp_now_send(mac, data, len); }
+// ----- Tiny non-blocking TX queue for ESP-NOW -----
+#define TXQ_SIZE 16
+struct TxFrame { uint8_t len; uint8_t buf[64]; };
+static TxFrame txq[TXQ_SIZE];
+static volatile uint8_t txHead = 0, txTail = 0;
+
+static inline bool enqueueTx(const void* data, uint8_t len){
+  uint8_t nhead = (uint8_t)((txHead + 1) % TXQ_SIZE);
+  if (nhead == txTail) return false;        // full -> drop (or count drops)
+  if (len > sizeof(txq[0].buf)) len = sizeof(txq[0].buf);
+  memcpy(txq[txHead].buf, data, len);
+  txq[txHead].len = len;
+  txHead = nhead;
+  return true;
+}
+static void pumpTx(){
+  while (txTail != txHead){
+    TxFrame &f = txq[txTail];
+    esp_err_t r = esp_now_send(kBroadcast, f.buf, f.len);
+    if (r == ESP_OK) txTail = (uint8_t)((txTail + 1) % TXQ_SIZE);
+    else break; // try again next loop tick
+  }
+}
+static void onNowSent(const wifi_tx_info_t* info, esp_now_send_status_t status) {
+  // (optional) inspect info->dest_addr, info->pkt_len, etc.
+  pumpTx();  // kick the TX queue again
+}
+
+static void sendRaw(const uint8_t* mac, const uint8_t* data, size_t len){
+  // Try immediate; fall back to queue if radio is momentarily full.
+  if (esp_now_send(mac, data, len) == ESP_OK) return;
+  enqueueTx(data, (uint8_t)((len > 64) ? 64 : len));
+}
+
 static void sendHello(){ HelloMsg m{}; m.h={HELLO,PROTO_VER,gNodeId,0,gSeq++,sizeof(HelloMsg)}; m.role=1; m.caps=0; sendRaw(kBroadcast,(uint8_t*)&m,sizeof(m)); }
 static void sendGateEvent(uint8_t gateId, uint8_t ev, uint16_t strengthMm){
   GateEventMsg m{}; m.h={GATE_EVENT,PROTO_VER,gNodeId,0,gSeq++,sizeof(GateEventMsg)};
@@ -243,6 +276,11 @@ static void sendNodeStatus() {
   sendRaw(kBroadcast, (uint8_t*)&m, sizeof(m));
 }
 
+// LED render throttle (event-driven)
+static volatile bool ledDirty = false;
+static uint32_t nextShowAt = 0;
+static const uint32_t LED_MIN_INTERVAL_MS = 40;  // ~25 fps max, tweakable
+
 // ---------- ESP-NOW RX ----------
 static void onNowRecv(const esp_now_recv_info* info, const uint8_t* data, int len){
   if (!info || len < (int)sizeof(PktHeader)) return; auto *h=(const PktHeader*)data;
@@ -274,6 +312,7 @@ static void onNowRecv(const esp_now_recv_info* info, const uint8_t* data, int le
       for (uint16_t i = m->start; i < end; ++i)
         strips[m->strip]->setPixelColor(i, strips[m->strip]->Color(m->r, m->g, m->b));
     }
+    ledDirty = true;
     return;
   }
 
@@ -358,6 +397,8 @@ static void onNowRecv(const esp_now_recv_info* info, const uint8_t* data, int le
 }
 
 // ---------- OTA visuals (dynamic across all strips) ----------
+static volatile bool gOtaMode = false;
+
 static void drawOtaProgress(size_t done, size_t total){
   float f = total ? (float)done/(float)total : 0.f;
   uint32_t totalPix = 0; for (uint8_t i=0;i<stripCount;i++) totalPix += cfg[i].count;
@@ -408,6 +449,7 @@ static void stopEspNow(){ esp_now_deinit(); }
 static esp_err_t startEspNow(){ if (esp_now_init()!=ESP_OK) return ESP_FAIL; esp_now_register_recv_cb(onNowRecv); esp_now_peer_info_t p{}; memcpy(p.peer_addr,kBroadcast,6); p.channel=6; p.encrypt=false; p.ifidx=WIFI_IF_STA; esp_now_add_peer(&p); return ESP_OK; }
 static bool connectWifiSta(const String& ssid, const String& pass, uint32_t timeoutMs=15000){ WiFi.disconnect(true); WiFi.mode(WIFI_STA); WiFi.begin(ssid.c_str(), pass.c_str()); uint32_t t0=millis(); while (WiFi.status()!=WL_CONNECTED && (millis()-t0)<timeoutMs) delay(100); return WiFi.status()==WL_CONNECTED; }
 static void performHttpOta(String url, String ssid, String pass){
+  gOtaMode = true;
   stopEspNow();
   if (ssid.length()==0) ssid = OTA_SSID;
   if (pass.length()==0) pass = OTA_PASS;
@@ -422,7 +464,7 @@ static void performHttpOta(String url, String ssid, String pass){
   Serial.printf("[OTA] GET %s\n", url.c_str());
   t_httpUpdate_return r = httpUpdate.update(client, url);
   if (r==HTTP_UPDATE_OK){ Serial.println("[OTA] OK, rebooting"); showOtaSuccess(); delay(400); ESP.restart(); }
-  else { Serial.printf("[OTA] Fail code=%d\n", (int)r); Serial.printf("[OTA] Error: %s\n", httpUpdate.getLastErrorString().c_str()); showOtaError(); esp_wifi_set_channel(6, WIFI_SECOND_CHAN_NONE); startEspNow(); }
+  else { Serial.printf("[OTA] Fail code=%d\n", (int)r); Serial.printf("[OTA] Error: %s\n", httpUpdate.getLastErrorString().c_str()); showOtaError(); esp_wifi_set_channel(6, WIFI_SECOND_CHAN_NONE); startEspNow(); gOtaMode = false; }
 }
 
 // ---------- TCA9548A ----------
@@ -460,11 +502,16 @@ static uint32_t lastRender=0;
 static bool i2cBusy=false;
 
 static void render(){
-  if (millis()-lastRender < RENDER_MS) return;
-  if (i2cBusy) return;
-  lastRender = millis();
+  if (!ledDirty) return;         // only show when pixels really changed
+  if (i2cBusy) return;           // never render during I2C (protect ToF)
+  uint32_t now = millis();
+  if (now < nextShowAt) return;  // cap frame rate
+
   for (uint8_t i=0;i<stripCount;i++)
     if (strips[i]) strips[i]->show();
+
+  ledDirty = false;
+  nextShowAt = now + LED_MIN_INTERVAL_MS;
 }
 
 // ---------- Button polling (dynamic) ----------
@@ -530,6 +577,9 @@ static void reinitIfNeeded(uint8_t i, const char* why) {
   else            Serial.printf("[RECOVER] FAIL ch %u\n", ch);
   errStreak[i] = 0;
 }
+
+static uint32_t lastEnterSentMs[8] = {0};
+#define ENTER_COOLDOWN_MS 150   // 0 = off; 150ms ≈ ~6–7 msgs/sec max per ch
 
 static void pollOne(uint8_t i) {
   if (!inited[i]) return;
@@ -598,7 +648,13 @@ static void pollOne(uint8_t i) {
 
     if (updated) {
       uint8_t gate = tofGateByCh[ch];
-      if (gate) sendGateEvent(gate, /*ENTER*/1, mm); // EXACT: only ENTER events on valid frames
+      if (gate) {
+        uint32_t nowMs = millis();
+        if (ENTER_COOLDOWN_MS == 0 || (nowMs - lastEnterSentMs[ch]) >= ENTER_COOLDOWN_MS) {
+          sendGateEvent(gate, /*ENTER*/1, mm);
+          lastEnterSentMs[ch] = nowMs;
+        }
+      }
     }
   } else {
     tcaDeselectAll();
@@ -622,13 +678,15 @@ void setup(){
   loadBtnPins();  applyBtnPins();
 
   Wire.begin(PIN_SDA, PIN_SCL);
-  Wire.setClock(200000);          // EXACT like test
+  Wire.setClock(200000);
+  Wire.setTimeOut(20);
   delay(150);
   tcaDeselectAll();
 
   WiFi.mode(WIFI_STA);
   esp_wifi_set_channel(6, WIFI_SECOND_CHAN_NONE);
   if (esp_now_init()==ESP_OK){
+    esp_now_register_send_cb(onNowSent);
     esp_now_register_recv_cb(onNowRecv);
     esp_now_peer_info_t p{}; memcpy(p.peer_addr,kBroadcast,6);
     p.channel=6; p.encrypt=false; p.ifidx=WIFI_IF_STA; esp_now_add_peer(&p);
@@ -652,7 +710,9 @@ void setup(){
 // ---------- Loop ----------
 void loop(){
 #if TOF_ENABLED
-  for (uint8_t ch=0; ch<8; ch++) pollOne(ch);
+  if (!gOtaMode) {
+    for (uint8_t ch=0; ch<8; ch++) pollOne(ch);
+  }
 #endif
   pollButtons();
   render();
@@ -666,4 +726,6 @@ void loop(){
   uint32_t now = millis();
   if (gHelloPending && (int32_t)(now - helloDueAt) >= 0){ gHelloPending=false; sendHello(); }
   if (gStatusPending && (int32_t)(now - statusDueAt) >= 0){ gStatusPending=false; sendNodeStatus(); }
+
+  pumpTx();
 }
