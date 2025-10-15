@@ -28,25 +28,15 @@
 #ifndef TOF_ENABLED
 #define TOF_ENABLED 1
 #endif
-#ifndef ACCEPT_RS5
-#define ACCEPT_RS5 1   // allow RangeStatus 5 if needed later
-#endif
+// EXACT TEST PARITY: accept RS==0 only
+#undef  ACCEPT_RS5
+#define ACCEPT_RS5 0
 
 // ---------- Fixed pins (I2C / lamps defaults) ----------
 #define PIN_SDA 8
 #define PIN_SCL 9
 #define PIN_LAMP1 12
 #define PIN_LAMP2 6
-
-// ===== ToF tuning (overhead, fast-moving people) =====
-static const uint16_t TOF_MIN_MM       = 500;   // was 600
-static const uint16_t TOF_MAX_MM       = 2200;  // was 2000
-static const float    TOF_MIN_SIG_MCPS = 0.25f; // was 0.35f or none
-static const uint32_t TOF_BUDGET_US    = 66000; // 50 ms (try 66000 if needed)
-static const uint8_t  TOF_DEB_ENTER    = 1;     // ENTER on 1 valid frame
-static const uint8_t  TOF_DEB_EXIT     = 2;     // EXIT after 2 misses
-static const uint16_t TOF_REARM_MS     = 300;   // was 500
-static const unsigned long TOF_POLL_INTERVAL_MS = 30; // was 60
 
 // ---------- Dynamic LED strips (up to 5) ----------
 static const uint8_t MAX_STRIPS = 5;
@@ -144,7 +134,6 @@ static void saveTofMap(const uint8_t g[8]){
 }
 static void loadTofMap(){
   Preferences p; p.begin("maze", true);
-  // if unset, keep defaults (Node 4); otherwise load
   bool any = false;
   for (uint8_t i=0;i<8;i++){
     char k[6]; snprintf(k,6,"tg%u",i);
@@ -236,12 +225,9 @@ static void sendBtnPinsRsp(){
 static volatile bool gHelloPending=false, gStatusPending=false;
 static uint32_t helloDueAt=0, statusDueAt=0;
 
-#if TOF_ENABLED
+// ---------- Node status ----------
 static bool     inited[8]    = {0};
 static uint8_t  errStreak[8] = {0};
-#endif
-
-// ---------- Node status ----------
 static void sendNodeStatus() {
   NodeStatusMsg m{};
   m.h = { NODE_STATUS, PROTO_VER, gNodeId, 0, gSeq++, (uint16_t)sizeof(NodeStatusMsg) };
@@ -441,10 +427,17 @@ static void performHttpOta(String url, String ssid, String pass){
 
 // ---------- TCA9548A ----------
 #define TCA_ADDR 0x70
+static inline void tcaDeselectAll(){
+  Wire.beginTransmission(TCA_ADDR);
+  Wire.write(0x00);
+  Wire.endTransmission();
+  delay(2);
+}
 static inline bool tcaSelect(uint8_t ch){
   if (ch>7) return false;
   Wire.beginTransmission(TCA_ADDR); Wire.write(1<<ch);
-  bool ok = (Wire.endTransmission()==0); if (ok) delay(5);
+  bool ok = (Wire.endTransmission()==0);
+  if (ok) delay(5); // EXACT like test
   return ok;
 }
 static void tcaOff(){ Wire.beginTransmission(TCA_ADDR); Wire.write(0); Wire.endTransmission(); }
@@ -456,20 +449,10 @@ VL53L4CX tof0(&DEV_I2C, 255), tof1(&DEV_I2C, 255), tof2(&DEV_I2C, 255), tof3(&DE
          tof4(&DEV_I2C, 255), tof5(&DEV_I2C, 255), tof6(&DEV_I2C, 255), tof7(&DEV_I2C, 255);
 VL53L4CX* TOF[NUM_SENSORS] = { &tof0,&tof1,&tof2,&tof3,&tof4,&tof5,&tof6,&tof7 };
 
-// Node 4 TCA mapping (from CSV) — used for GateEvent numbering on Node 4
-static uint8_t kGateByTcaPort[8] = { 23,24,28,29,34,35,39,40 };
-
-// Detect window / debounce
+// ---------- EXACT TEST DETECTION CONFIG ----------
 static const uint16_t MIN_MM = 600, MAX_MM = 2000;
 static const uint8_t  MAX_ERR_BEFORE_REINIT = 4;
 static const unsigned long POLL_INTERVAL_MS = 60;
-static const uint8_t  DEBOUNCE = 2;
-static const uint16_t REARM_MS = 500;
-static unsigned long lastPollMs[NUM_SENSORS] = {0};
-static unsigned long lastHeartbeatMs[NUM_SENSORS] = {0};
-static uint8_t  hits[NUM_SENSORS] = {0};
-static bool     present[NUM_SENSORS] = {0};
-static uint32_t rearmUntil[NUM_SENSORS] = {0};
 
 // ---------- Render ----------
 static const uint32_t RENDER_MS = 33;
@@ -499,61 +482,130 @@ static void pollButtons(){
   }
 }
 
-// ---------- ToF sampling ----------
-static void sampleCh(uint8_t ch){
-#if TOF_ENABLED
-  if (!inited[ch]) return;
-  unsigned long now = millis();
-  if (now - lastPollMs[ch] < TOF_POLL_INTERVAL_MS) return;
-  lastPollMs[ch] = now;
+// ---------- ToF init / reinit / polling  (EXACT TEST CORE) ----------
+static bool initOne(uint8_t i) {
+  const uint8_t ch = i;
 
+  for (int attempt = 0; attempt < 3; ++attempt) {
+    if (!tcaSelect(ch)) {
+      if (attempt == 2) { Serial.printf("[TCA] Channel select failed during init (ch %u)\n", ch); return false; }
+      delay(5);
+      continue;
+    }
+
+    delay(5); // settle like the test
+
+    TOF[ch]->begin();
+    // EXACT like test: standard 8-bit address 0x52
+    VL53L4CX_Error st = TOF[ch]->InitSensor(0x52);
+    if (st) {
+      TOF[ch]->VL53L4CX_StopMeasurement();
+      delay(5);
+      st = TOF[ch]->InitSensor(0x52);
+    }
+    if (!st) st = TOF[ch]->VL53L4CX_StartMeasurement();
+
+    tcaDeselectAll();
+
+    if (!st) {
+      inited[ch]    = true;
+      errStreak[ch] = 0;
+      Serial.printf("[VL53] READY ch %u\n", ch);
+      return true;
+    }
+
+    Serial.printf("[VL53] Init/start failed ch %u (err=%d) attempt %d\n", ch, (int)st, attempt+1);
+    tcaDeselectAll();
+    delay(10);
+  }
+  return false;
+}
+
+static void reinitIfNeeded(uint8_t i, const char* why) {
+  if (errStreak[i] < MAX_ERR_BEFORE_REINIT) return;
+  uint8_t ch = i;
+  Serial.printf("[RECOVER] Reinit ch %u (%s)\n", ch, why);
+  inited[i] = false;
+  if (initOne(i)) Serial.printf("[RECOVER] OK ch %u\n", ch);
+  else            Serial.printf("[RECOVER] FAIL ch %u\n", ch);
+  errStreak[i] = 0;
+}
+
+static void pollOne(uint8_t i) {
+  if (!inited[i]) return;
+
+  unsigned long now = millis();
+  if (now - lastRender < 1) {} // no-op, keep lastRender referenced if LTO prunes
+  static unsigned long lastPollMs[NUM_SENSORS] = {0};
+  static unsigned long lastHeartbeatMs[NUM_SENSORS] = {0};
+
+  if (now - lastPollMs[i] < POLL_INTERVAL_MS) return;
+  lastPollMs[i] = now;
+
+  uint8_t ch = i;
   i2cBusy = true;
-  if (!tcaSelect(ch)) { i2cBusy=false; if (++errStreak[ch] >= MAX_ERR_BEFORE_REINIT) { /*lazy*/ } return; }
+  if (!tcaSelect(ch)) { i2cBusy=false; errStreak[i]++; reinitIfNeeded(i, "TCA select"); return; }
 
   uint8_t ready = 0;
-  if (TOF[ch]->VL53L4CX_GetMeasurementDataReady(&ready) != 0){ i2cBusy=false; tcaOff(); if (++errStreak[ch] >= MAX_ERR_BEFORE_REINIT){ /*lazy*/ } return; }
-  if (!ready){ i2cBusy=false; tcaOff(); return; }
-
-  VL53L4CX_MultiRangingData_t R{};
-  if (TOF[ch]->VL53L4CX_GetMultiRangingData(&R) != 0){ i2cBusy=false; tcaOff(); if (++errStreak[ch] >= MAX_ERR_BEFORE_REINIT){ /*lazy*/ } return; }
-
-  bool valid=false; uint16_t mm=8191;
-  if (R.NumberOfObjectsFound > 0){
-    for (int j=0;j<R.NumberOfObjectsFound;++j){
-      const uint8_t  rs = R.RangeData[j].RangeStatus;
-      const uint16_t m  = R.RangeData[j].RangeMilliMeter;
-      const float    s  = (float)R.RangeData[j].SignalRateRtnMegaCps / 65536.0f;
-  #if ACCEPT_RS5
-      if ((rs==0 || rs==5) && m>=TOF_MIN_MM && m<=TOF_MAX_MM && s>=TOF_MIN_SIG_MCPS) { valid=true; mm=m; break; }
-  #else
-      if (rs==0 && m>=TOF_MIN_MM && m<=TOF_MAX_MM && s>=TOF_MIN_SIG_MCPS) { valid=true; mm=m; break; }
-  #endif
+  int st = TOF[i]->VL53L4CX_GetMeasurementDataReady(&ready);
+  if (st) {
+    errStreak[i]++;
+    tcaDeselectAll();
+    i2cBusy=false;
+    reinitIfNeeded(i, "GetReady");
+    return;
+  }
+  if (!ready) {
+    if (now - lastHeartbeatMs[i] > 1000) {
+      Serial.printf("[HB] ch%u: no new data yet\n", ch);
+      lastHeartbeatMs[i] = now;
     }
+    tcaDeselectAll();
+    i2cBusy=false;
+    return;
   }
 
-  TOF[ch]->VL53L4CX_ClearInterruptAndStartMeasurement();
-  tcaOff(); i2cBusy=false;
-  errStreak[ch]=0;
+  VL53L4CX_MultiRangingData_t data;
+  st = TOF[i]->VL53L4CX_GetMultiRangingData(&data);
+  if (st == 0) {
+    errStreak[i] = 0;
+    bool updated = false;
+    uint16_t mm  = 8191;
 
-  // Update hits counter
-  if (valid) { if (hits[ch] < 255) hits[ch]++; }
-  else        { if (hits[ch] > 0)   hits[ch]--; }
+    for (int j = 0; j < data.NumberOfObjectsFound; j++) {
+      uint16_t m = data.RangeData[j].RangeMilliMeter;
+      uint8_t  r = data.RangeData[j].RangeStatus;
 
-  // ENTER / EXIT logic (asymmetric)
-  if (!present[ch]){
-    if (hits[ch] >= TOF_DEB_ENTER && millis() >= rearmUntil[ch]){
-      present[ch] = true;
-      rearmUntil[ch] = millis() + TOF_REARM_MS;
-      uint8_t gate = tofGateByCh[ch]; if (gate) sendGateEvent(gate, 1, mm); // ENTER
+#if ACCEPT_RS5
+      bool ok = ((r == 0 || r == 5) && m >= MIN_MM && m <= MAX_MM);
+#else
+      bool ok = ((r == 0) && m >= MIN_MM && m <= MAX_MM); // EXACT test behavior
+#endif
+      if (ok) {
+        mm = m;
+        float sig = (float)data.RangeData[j].SignalRateRtnMegaCps / 65536.0f;
+        float amb = (float)data.RangeData[j].AmbientRateRtnMegaCps / 65536.0f;
+        Serial.printf("ToF%u(ch%u): D=%u mm, Signal=%.3f, Ambient=%.3f\n",
+                      (unsigned)i, (unsigned)ch, (unsigned)mm, sig, amb);
+        updated = true;
+        break; // first valid object
+      }
+    }
+
+    TOF[i]->VL53L4CX_ClearInterruptAndStartMeasurement();
+    tcaDeselectAll();
+    i2cBusy=false;
+
+    if (updated) {
+      uint8_t gate = tofGateByCh[ch];
+      if (gate) sendGateEvent(gate, /*ENTER*/1, mm); // EXACT: only ENTER events on valid frames
     }
   } else {
-    if (hits[ch] < TOF_DEB_EXIT){
-      present[ch] = false;
-      uint8_t gate = tofGateByCh[ch]; if (gate) sendGateEvent(gate, 2, mm); // EXIT
-    }
+    tcaDeselectAll();
+    i2cBusy=false;
+    errStreak[i]++;
+    reinitIfNeeded(i, "GetData");
   }
-
-#endif
 }
 
 // ---------- Setup ----------
@@ -570,8 +622,9 @@ void setup(){
   loadBtnPins();  applyBtnPins();
 
   Wire.begin(PIN_SDA, PIN_SCL);
-  Wire.setClock(100000);
+  Wire.setClock(200000);          // EXACT like test
   delay(150);
+  tcaDeselectAll();
 
   WiFi.mode(WIFI_STA);
   esp_wifi_set_channel(6, WIFI_SECOND_CHAN_NONE);
@@ -582,23 +635,16 @@ void setup(){
   }
 
   prefs.begin("maze", false); gNodeId = prefs.getUChar("nodeId", 4); prefs.end();
-  loadTofMap();   // after prefs.begin/prefs.end for nodeId, or simply near other loads
+  loadTofMap();   // after prefs for nodeId if you key maps per node externally
   sendHello();
 
 #if TOF_ENABLED
-  // init per-channel sensors (Node 4 mapping assumed for gate IDs)
+  // init per-channel sensors
   for (uint8_t ch=0; ch<8; ch++){
-    if (!tcaSelect(ch)) { inited[ch]=false; continue; }
-    delay(5);
-    TOF[ch]->begin();
-    VL53L4CX_Error st = TOF[ch]->InitSensor(0x12);
-    // Per-channel tuning
-    // TOF[ch]->VL53L4CX_SetDistanceMode(VL53L4CX_DISTANCEMODE_LONG);
-    TOF[ch]->VL53L4CX_SetMeasurementTimingBudgetMicroSeconds(TOF_BUDGET_US);
-    if (!st) st = TOF[ch]->VL53L4CX_StartMeasurement();
-    inited[ch] = (st==0);
-    tcaOff();
-    Serial.printf("[VL53] ch%u %s\n", ch, inited[ch]?"READY":"FAIL");
+    if (!initOne(ch)) {
+      inited[ch] = false;
+      Serial.printf("[WARN] Sensor %u failed to init, will retry later.\n", ch);
+    }
   }
 #endif
 }
@@ -606,7 +652,7 @@ void setup(){
 // ---------- Loop ----------
 void loop(){
 #if TOF_ENABLED
-  for (uint8_t ch=0; ch<8; ch++) sampleCh(ch);
+  for (uint8_t ch=0; ch<8; ch++) pollOne(ch);
 #endif
   pollButtons();
   render();
