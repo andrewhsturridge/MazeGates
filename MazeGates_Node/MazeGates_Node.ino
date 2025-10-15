@@ -29,7 +29,7 @@
 #define TOF_ENABLED 1
 #endif
 #ifndef ACCEPT_RS5
-#define ACCEPT_RS5 0   // allow RangeStatus 5 if needed later
+#define ACCEPT_RS5 1   // allow RangeStatus 5 if needed later
 #endif
 
 // ---------- Fixed pins (I2C / lamps defaults) ----------
@@ -37,6 +37,16 @@
 #define PIN_SCL 9
 #define PIN_LAMP1 12
 #define PIN_LAMP2 6
+
+// ===== ToF tuning (overhead, fast-moving people) =====
+static const uint16_t TOF_MIN_MM       = 500;   // was 600
+static const uint16_t TOF_MAX_MM       = 2200;  // was 2000
+static const float    TOF_MIN_SIG_MCPS = 0.25f; // was 0.35f or none
+static const uint32_t TOF_BUDGET_US    = 66000; // 50 ms (try 66000 if needed)
+static const uint8_t  TOF_DEB_ENTER    = 1;     // ENTER on 1 valid frame
+static const uint8_t  TOF_DEB_EXIT     = 2;     // EXIT after 2 misses
+static const uint16_t TOF_REARM_MS     = 300;   // was 500
+static const unsigned long TOF_POLL_INTERVAL_MS = 30; // was 60
 
 // ---------- Dynamic LED strips (up to 5) ----------
 static const uint8_t MAX_STRIPS = 5;
@@ -494,7 +504,7 @@ static void sampleCh(uint8_t ch){
 #if TOF_ENABLED
   if (!inited[ch]) return;
   unsigned long now = millis();
-  if (now - lastPollMs[ch] < POLL_INTERVAL_MS) return;
+  if (now - lastPollMs[ch] < TOF_POLL_INTERVAL_MS) return;
   lastPollMs[ch] = now;
 
   i2cBusy = true;
@@ -510,27 +520,39 @@ static void sampleCh(uint8_t ch){
   bool valid=false; uint16_t mm=8191;
   if (R.NumberOfObjectsFound > 0){
     for (int j=0;j<R.NumberOfObjectsFound;++j){
-      const uint8_t rs = R.RangeData[j].RangeStatus;
+      const uint8_t  rs = R.RangeData[j].RangeStatus;
       const uint16_t m  = R.RangeData[j].RangeMilliMeter;
-#if ACCEPT_RS5
-      if ((rs==0 || rs==5) && m>=MIN_MM && m<=MAX_MM) { valid=true; mm=m; break; }
-#else
-      if (rs==0 && m>=MIN_MM && m<=MAX_MM) { valid=true; mm=m; break; }
-#endif
+      const float    s  = (float)R.RangeData[j].SignalRateRtnMegaCps / 65536.0f;
+  #if ACCEPT_RS5
+      if ((rs==0 || rs==5) && m>=TOF_MIN_MM && m<=TOF_MAX_MM && s>=TOF_MIN_SIG_MCPS) { valid=true; mm=m; break; }
+  #else
+      if (rs==0 && m>=TOF_MIN_MM && m<=TOF_MAX_MM && s>=TOF_MIN_SIG_MCPS) { valid=true; mm=m; break; }
+  #endif
     }
   }
+
   TOF[ch]->VL53L4CX_ClearInterruptAndStartMeasurement();
   tcaOff(); i2cBusy=false;
   errStreak[ch]=0;
 
-  if (valid) { if (hits[ch]<255) hits[ch]++; } else { if (hits[ch]>0) hits[ch]--; }
-  bool cand = (hits[ch] >= DEBOUNCE);
+  // Update hits counter
+  if (valid) { if (hits[ch] < 255) hits[ch]++; }
+  else        { if (hits[ch] > 0)   hits[ch]--; }
 
+  // ENTER / EXIT logic (asymmetric)
   if (!present[ch]){
-    if (cand && millis() >= rearmUntil[ch]){ present[ch]=true; rearmUntil[ch]=millis()+REARM_MS; uint8_t gate = tofGateByCh[ch]; if (gate == 0) return; sendGateEvent(gate,1,mm); }
+    if (hits[ch] >= TOF_DEB_ENTER && millis() >= rearmUntil[ch]){
+      present[ch] = true;
+      rearmUntil[ch] = millis() + TOF_REARM_MS;
+      uint8_t gate = tofGateByCh[ch]; if (gate) sendGateEvent(gate, 1, mm); // ENTER
+    }
   } else {
-    if (!cand){ present[ch]=false; uint8_t gate = tofGateByCh[ch]; if (gate == 0) return; sendGateEvent(gate,2,mm); }
+    if (hits[ch] < TOF_DEB_EXIT){
+      present[ch] = false;
+      uint8_t gate = tofGateByCh[ch]; if (gate) sendGateEvent(gate, 2, mm); // EXIT
+    }
   }
+
 #endif
 }
 
@@ -548,7 +570,7 @@ void setup(){
   loadBtnPins();  applyBtnPins();
 
   Wire.begin(PIN_SDA, PIN_SCL);
-  Wire.setClock(200000);
+  Wire.setClock(100000);
   delay(150);
 
   WiFi.mode(WIFI_STA);
@@ -570,6 +592,9 @@ void setup(){
     delay(5);
     TOF[ch]->begin();
     VL53L4CX_Error st = TOF[ch]->InitSensor(0x12);
+    // Per-channel tuning
+    // TOF[ch]->VL53L4CX_SetDistanceMode(VL53L4CX_DISTANCEMODE_LONG);
+    TOF[ch]->VL53L4CX_SetMeasurementTimingBudgetMicroSeconds(TOF_BUDGET_US);
     if (!st) st = TOF[ch]->VL53L4CX_StartMeasurement();
     inited[ch] = (st==0);
     tcaOff();
