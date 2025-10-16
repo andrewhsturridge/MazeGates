@@ -120,6 +120,133 @@ static const GateMapEntry GATE_MAP[45] = {
   /*42*/ {5,3,  0,45},  /*43*/ {5,3, 45,45},  /*44*/ {5,3, 90,50},
 };
 
+// ===== BaseConfig (server-side reference & quick reprovision) =====
+struct BtnSigDef  { uint8_t b, nodeId, localIdx; }; // B# -> node + local button index
+struct BtnLampDef { uint8_t b, nodeId, lampIdx;  }; // B# -> node + lampIdx (1=IO12,2=IO6,3=IO5)
+struct BtnPinsDef { uint8_t nodeId; const char* pinsCsv; }; // node button pins in order
+
+// ===== Capture caches for BaseConfig =====
+struct CapLed { uint8_t n; uint8_t pin[5]; uint16_t count[5]; bool have; };
+static CapLed capLed[8] = {}; // index by nodeId (0..7)
+
+struct CapTof { uint8_t g[8]; bool have; };
+static CapTof capTof[8] = {};
+
+
+// Button signals (B# -> node/local idx)
+static const BtnSigDef kBaseBtnSig[] = {
+  { 1,4,1 }, { 2,4,2 },
+  { 3,1,1 }, { 4,1,2 }, { 5,1,3 },
+  { 6,2,1 }, { 7,2,2 },
+  { 8,3,1 }, { 9,3,2 }, {10,3,3 },
+  {11,6,1 }, {12,6,2 },
+};
+
+// Button lamps (B# -> node/lampIdx).
+static const BtnLampDef kBaseBtnLamp[] = {
+  { 1,4,1 }, { 2,4,2 },
+  { 3,1,1 }, { 4,1,2 }, { 5,1,3 },
+  { 6,2,1 }, { 7,2,2 },
+  { 8,3,1 }, { 9,3,2 }, {10,3,3 },
+  {11,6,1 }, {12,6,2 },
+};
+
+// Node button pin lists
+static const BtnPinsDef kBaseBtnPins[] = {
+  {1, "17,18,14"},
+  {2, "17,18"},
+  {3, "17,18,14"},
+  {4, "17,18"},
+  {6, "17,18"},
+};
+
+// ---- Optional scaffolding for LED/ToF base maps (safe when empty) ----
+struct LedMapDef { uint8_t nodeId, strip, gpio; uint16_t count; };
+struct TofMapDef { uint8_t nodeId; uint8_t g[8]; };
+
+// ---- Filled BaseConfig: LED/ToF maps (generated from your '... get' results) ----
+// NOTE: strip index is the order returned by each node (0..n-1)
+
+static const LedMapDef kBaseLedMapArr[] = {
+  // node 1: 10:185, 11:185
+  { 1, 0, 10, 185 }, { 1, 1, 11, 185 },
+
+  // node 2: 1:140, 7:140, 10:140, 11:140
+  { 2, 0,  1, 140 }, { 2, 1,  7, 140 }, { 2, 2, 10, 140 }, { 2, 3, 11, 140 },
+
+  // node 3: 10:185, 11:185
+  { 3, 0, 10, 185 }, { 3, 1, 11, 185 },
+
+  // node 4: 10:185, 11:185
+  { 4, 0, 10, 185 }, { 4, 1, 11, 185 },
+
+  // node 5: 1:140, 7:140, 10:140, 11:140, 12:185
+  { 5, 0,  1, 140 }, { 5, 1,  7, 140 }, { 5, 2, 10, 140 }, { 5, 3, 11, 140 }, { 5, 4, 12, 185 },
+
+  // node 6: 10:185, 11:185
+  { 6, 0, 10, 185 }, { 6, 1, 11, 185 },
+};
+static const size_t     kBaseLedMapCount = sizeof(kBaseLedMapArr)/sizeof(kBaseLedMapArr[0]);
+static const LedMapDef* kBaseLedMap      = kBaseLedMapArr;
+
+// ToF maps (8 slots each)
+static const TofMapDef kBaseTofMapArr[] = {
+  { 1, {  1,  2,  6,  7, 12, 13, 17, 18 } },
+  { 2, {  3,  8,  9, 14, 19, 20,  0,  0 } },
+  { 3, {  4,  5, 10, 11, 15, 16, 21, 22 } },
+  { 4, { 23, 24, 28, 29, 34, 35, 39, 40 } },
+  { 5, { 25, 30, 31, 36, 41, 42,  0,  0 } },
+  { 6, { 26, 27, 32, 33, 37, 38, 43, 44 } },
+};
+static const size_t     kBaseTofMapCount = sizeof(kBaseTofMapArr)/sizeof(kBaseTofMapArr[0]);
+static const TofMapDef* kBaseTofMap      = kBaseTofMapArr;
+
+// Utilities
+template<typename T, size_t N> constexpr size_t arrlen(const T(&)[N]) { return N; }
+
+static void basePrint(const char* what){
+  auto eq = [&](const char* a, const char* b){ return strcmp(a,b)==0; };
+
+  if (eq(what,"all") || eq(what,"btnpins")){
+    for (size_t i=0;i<arrlen(kBaseBtnPins);++i)
+      Serial.printf("btnpins set %u %s\n", kBaseBtnPins[i].nodeId, kBaseBtnPins[i].pinsCsv);
+    Serial.println();
+  }
+  if (eq(what,"all") || eq(what,"btnsig")){
+    for (size_t i=0;i<arrlen(kBaseBtnSig);++i)
+      Serial.printf("btnsig set %u %u %u\n", kBaseBtnSig[i].b, kBaseBtnSig[i].nodeId, kBaseBtnSig[i].localIdx);
+    Serial.println();
+  }
+  if (eq(what,"all") || eq(what,"btnmap")){
+    for (size_t i=0;i<arrlen(kBaseBtnLamp);++i)
+      Serial.printf("btnmap %u %u %u\n", kBaseBtnLamp[i].b, kBaseBtnLamp[i].nodeId, kBaseBtnLamp[i].lampIdx);
+    Serial.println();
+  }
+  if (eq(what,"ledmap")){
+    if (!kBaseLedMap || kBaseLedMapCount == 0) {
+      Serial.println("// kBaseLedMap is empty; run 'base plan ledmap' to print capture commands.");
+    } else {
+      for (size_t i=0; i<kBaseLedMapCount; ++i){
+        auto d = kBaseLedMap[i];
+        Serial.printf("ledmap set %u %u %u %u\n", d.nodeId, d.strip, d.gpio, d.count);
+      }
+    }
+    Serial.println();
+  }
+  if (eq(what,"tofmap")){
+    if (!kBaseTofMap || kBaseTofMapCount == 0) {
+      Serial.println("// kBaseTofMap is empty; run 'base plan tofmap' to print capture commands.");
+    } else {
+      for (size_t i=0; i<kBaseTofMapCount; ++i){
+        auto d = kBaseTofMap[i];
+        Serial.printf("tofmap set %u %u,%u,%u,%u,%u,%u,%u,%u\n",
+                      d.nodeId, d.g[0],d.g[1],d.g[2],d.g[3],d.g[4],d.g[5],d.g[6],d.g[7]);
+      }
+    }
+    Serial.println();
+  }
+}
+
 // --- ToF visualization toggle ---
 static bool gTofVis = false;            // off by default
 static uint8_t gTofR = 0, gTofG = 0, gTofB = 255;  // ENTER color (blue)
@@ -148,11 +275,11 @@ static Round G{WAITING, 0, 0, 0};
 
 // Button lamp mapping: btn -> (node,lampIdx)
 struct BtnLamp { uint8_t nodeId; uint8_t lampIdx; bool valid; };
-static BtnLamp BTNMAP[6] = {}; // 1..5 used
+static BtnLamp BTNMAP[13] = {}; // 1..12 used
 
 // Turn all configured lamps ON/OFF
 static void setAllLamps(bool on){
-  for (uint8_t b=1; b<=5; ++b){
+  for (uint8_t b=1; b<=12; ++b){
     if (!BTNMAP[b].valid) continue;
     sendLampCtrl(BTNMAP[b].nodeId, BTNMAP[b].lampIdx, on);
   }
@@ -160,7 +287,7 @@ static void setAllLamps(bool on){
 
 // Turn only the target lamp ON/OFF
 static void setTargetLamp(uint8_t btn, bool on){
-  if (btn>=1 && btn<=5 && BTNMAP[btn].valid){
+  if (btn>=1 && btn<=12 && BTNMAP[btn].valid){
     sendLampCtrl(BTNMAP[btn].nodeId, BTNMAP[btn].lampIdx, on);
   }
 }
@@ -184,21 +311,20 @@ static void paintAll(uint8_t r, uint8_t g, uint8_t b){
   }
 }
 
-// Start / end round
+// Start the round with target lamp ON; stepping on a non-walkable gate loses instantly
 static void gameStart(uint32_t seconds, uint8_t btn){
   G.st = PLAYING;
-  G.targetBtn = btn;
-  G.t0 = millis();
+  G.targetBtn  = btn;
+  G.t0         = millis();
   G.deadlineMs = seconds ? (seconds * 1000UL) : 0;
 
-  // Lamps: only target ON
-  setAllLamps(false);
-  setTargetLamp(btn, true);
-
-  // Baseline render: whatever is in 'walkable' right now
+  // Show safe path (green), hazards red; light the target button lamp now
   pushWalkable();
+  setAllLamps(false);
+  if (btn >= 1) setTargetLamp(btn, true);
 
-  Serial.printf("[GAME] START %lus target=Btn%u\n", (unsigned)seconds, btn);
+  Serial.printf("[GAME] START %lus target=Btn%u (avoid red; press target)\n",
+                (unsigned)seconds, btn);
 }
 
 static void gameEnd(bool win){
@@ -347,6 +473,14 @@ static void pushWalkable(){
   }
 }
 
+// Paint one gate with an explicit color (via GATE_MAP/routeGate)
+static inline void paintGate(uint8_t gateId, uint8_t r, uint8_t g, uint8_t b){
+  uint8_t nodeId, strip; uint16_t start, count;
+  if (routeGate(gateId, nodeId, strip, start, count)) {
+    sendLedRange(nodeId, strip, start, count, r,g,b);
+  }
+}
+
 static void processGateEvent(uint8_t gateId, uint8_t ev){
   uint8_t nodeId, strip; uint16_t start, count;
   if (!routeGate(gateId, nodeId, strip, start, count)) return;
@@ -360,6 +494,19 @@ static void processGateEvent(uint8_t gateId, uint8_t ev){
   // Otherwise repaint baseline (walkable=green, not=red)
   const bool ok = isWalkable(gateId);
   sendLedRange(nodeId, strip, start, count, ok?0:150, ok?150:0, 0);
+
+  // Hazard rule: stepping on a non-walkable gate ends the game immediately
+  if (G.st == PLAYING && ev == 1 /*ENTER*/){
+    if (gateId < 1 || gateId > GATE_MAX) return;
+    if (!walkable[gateId]) {
+      paintAll(150, 0, 0);      // one-frame red overlay for feedback
+      Serial.printf("[GAME] Hazard at gate %u — LOSE\n", gateId);
+      gameEnd(false);
+    } else {
+      // Optional: tiny highlight for safe steps (comment out if you prefer no extra feedback)
+      // paintGate(gateId, 0, 80, 0);
+    }
+  }
 }
 
 // ======= RX =======
@@ -444,20 +591,17 @@ static void onNowRecv(const esp_now_recv_info* info, const uint8_t* data, int le
     auto *m=(const OtaAckMsg*)data;
     Serial.printf("OTA_ACK from node %u (status=%u)\n", h->nodeId, m->status);
   }
-  else if (h->type==BUTTON_EVENT && len>=(int)sizeof(ButtonEventMsg)){
-    auto *m=(const ButtonEventMsg*)data;
-    Serial.printf("BUTTON%u %s from node %u\n",
-                  m->btnIdx, (m->ev==1?"PRESS":"RELEASE"), h->nodeId);
-    int globalB = resolveGlobalBtn(h->nodeId, m->btnIdx);
-    if (globalB > 0) {
-      Serial.printf("  => B%d\n", globalB);
-      // If you added game state earlier:
-      if (G.st == PLAYING && m->ev==1 /*PRESS*/){
-        if (globalB == G.targetBtn) gameEnd(true);
-        else { paintAll(150,0,0); Serial.println("[GAME] Wrong button (penalty)"); }
+  else if (h->type==BUTTON_EVENT && len >= (int)sizeof(ButtonEventMsg)){
+    auto *m = (const ButtonEventMsg*)data;
+    if (G.st == PLAYING && m->ev == 1 /*PRESS*/){
+      int globalB = resolveGlobalBtn(h->nodeId, m->btnIdx);
+      if (globalB == (int)G.targetBtn) {
+        gameEnd(true);
+      } else {
+        paintAll(150,0,0); // wrong button feedback; game continues until hazard or correct press
+        Serial.printf("[GAME] Wrong button (pressed B%d, target B%u)\n", globalB, G.targetBtn);
       }
     }
-
   }
   else if (h->type == NODE_STATUS && len >= (int)sizeof(NodeStatusMsg)) {
     const NodeStatusMsg* m = (const NodeStatusMsg*)data;
@@ -467,30 +611,22 @@ static void onNowRecv(const esp_now_recv_info* info, const uint8_t* data, int le
   }
   else if (h->type == LED_MAP_RSP && len >= (int)sizeof(LedMapRsp)) {
     const LedMapRsp* r = (const LedMapRsp*)data;
+
+    // capture for BaseConfig
+    capLed[h->nodeId].have = true;
+    capLed[h->nodeId].n = r->n;
+    for (uint8_t i=0; i<r->n && i<5; ++i){
+      capLed[h->nodeId].pin[i]   = r->e[i].pin;
+      capLed[h->nodeId].count[i] = r->e[i].count;
+    }
+
+    // existing logging (kept)
     if (r->n == 0) { qlogf("LEDMAP node %u: (none)", h->nodeId); }
     else {
       char line[LOG_LINE_MAX]; int pos = snprintf(line, sizeof(line), "LEDMAP node %u: ", h->nodeId);
-      for (uint8_t i=0; i<r->n && i<5; ++i) {
+      for (uint8_t i=0; i<r->n && i<5; ++i)
         pos += snprintf(line+pos, sizeof(line)-pos, "%s%u:%u", (i? ", " : ""), r->e[i].pin, r->e[i].count);
-      }
       qlogf("%s", line);
-    }
-  }
-  else if (h->type==BUTTON_EVENT && len>=(int)sizeof(ButtonEventMsg)){
-    auto *m=(const ButtonEventMsg*)data;
-    Serial.printf("BUTTON%u %s from node %u\n",
-                  m->btnIdx, (m->ev==1?"PRESS":"RELEASE"), h->nodeId);
-
-    // Only act on PRESS during PLAYING
-    if (G.st == PLAYING && m->ev == 1 /*PRESS*/){
-      if (m->btnIdx == G.targetBtn){
-        // WIN
-        gameEnd(true);
-      } else {
-        // Penalty overlay (single all-red overlay); baseline remains
-        paintAll(150,0,0);
-        Serial.println("[GAME] Wrong button (penalty overlay)");
-      }
     }
   }
   else if (h->type == BTN_PINS_RSP && len >= (int)sizeof(BtnPinsRsp)) {
@@ -502,10 +638,14 @@ static void onNowRecv(const esp_now_recv_info* info, const uint8_t* data, int le
   }
   else if (h->type == TOF_MAP_RSP && len >= (int)sizeof(TofMapRsp)) {
     const TofMapRsp* r = (const TofMapRsp*)data;
+
+    // capture for BaseConfig
+    capTof[h->nodeId].have = true;
+    for (int i=0;i<8;i++) capTof[h->nodeId].g[i] = r->g[i];
+
     qlogf("TOFMAP node %u: %u,%u,%u,%u,%u,%u,%u,%u",
           h->nodeId, r->g[0],r->g[1],r->g[2],r->g[3],r->g[4],r->g[5],r->g[6],r->g[7]);
   }
-
 }
 
 // ======= Setup / CLI / Loop =======
@@ -533,6 +673,9 @@ static void printHelp(){
   Serial.println("  tofvis on|off  (optional: tofvis on <r> <g> <b>)");
   Serial.println("  tofmap get <nodeId> | tofmap get all");
   Serial.println("  tofmap set <nodeId> g0,g1,g2,g3,g4,g5,g6,g7   (0=unused)");
+  Serial.println("  base print <all|btnpins|btnsig|btnmap|ledmap|tofmap>");
+  Serial.println("  base plan  <ledmap|tofmap|all>");
+  Serial.println("  base capture <ledmap|tofmap|all>");
 
 }
 
@@ -567,6 +710,9 @@ static void handleCli(String s){
 
   if (s=="help"){ printHelp(); return; }
   if (s=="hello"){ bcastHelloReq(); return; }
+  // base print <all|btnpins|btnsig|btnmap|ledmap|tofmap>
+  if (s.startsWith("base print ")){ basePrint(s.c_str()+11); return; }
+  if (s=="base print"){ basePrint("all"); return; }
 
   if (s=="roster"){
     for (auto &kv : nodesById){
@@ -632,16 +778,22 @@ static void handleCli(String s){
     return;
   }
 
-  // path set <ids>  -> clear -> add -> push
+  // path set <ids>  -> walkable (safe) = listed; non-walkable = hazard
   if (s.startsWith("path set ")){
     char buf[256]; s.toCharArray(buf, sizeof(buf));
     char *p = strstr(buf, "set ");
     clearWalkable();
-    if (p){ p += 4; char *tok = strtok(p, " ,");
-      while (tok){ int gid = atoi(tok); if (gid>=1 && gid<=GATE_MAX) walkable[gid]=true; tok = strtok(NULL, " ,"); }
+    if (p){
+      p += 4;
+      char *tok = strtok(p, " ,");
+      while (tok){
+        int gid = atoi(tok);
+        if (gid>=1 && gid<=GATE_MAX) walkable[gid] = true;
+        tok = strtok(NULL, " ,");
+      }
     }
-    pushWalkable();
-    Serial.println("path applied");
+    pushWalkable(); // paints safe=green; others red
+    Serial.println("path applied (hazard mode: stepping on non-walkable = LOSE)");
     return;
   }
 
@@ -768,25 +920,23 @@ static void handleCli(String s){
     return;
   }
 
-  // btnmap <btn> <nodeId> <lampIdx>
-  if (s.startsWith("btnmap ")){
-    int btn,nid,lidx;
-    if (sscanf(s.c_str(),"btnmap %d %d %d",&btn,&nid,&lidx)==3 && btn>=1 && btn<=5){
-      BTNMAP[btn] = { (uint8_t)nid, (uint8_t)lidx, true };
-      Serial.printf("BTNMAP: Btn%d -> node=%d lampIdx=%d\n", btn, nid, lidx);
-    } else {
-      Serial.println("usage: btnmap <btn> <nodeId> <lampIdx>");
+  // btnmap show
+  if (s=="btnmap show"){
+    Serial.println("Btn  node  lampIdx");
+    for (int b=1;b<=12;b++){
+      if (BTNMAP[b].valid) Serial.printf("%-3d  %-4u  %u\n", b, BTNMAP[b].nodeId, BTNMAP[b].lampIdx);
     }
     return;
   }
 
-  // game start <seconds> <btn>
-  if (s.startsWith("game start ")){
-    int secs=0, btn=0;
-    if (sscanf(s.c_str(),"game start %d %d",&secs,&btn)==2 && btn>=1 && btn<=5){
-      gameStart((uint32_t)secs, (uint8_t)btn);
+  // btnmap <btn 1..12> <nodeId> <lampIdx[1=IO12,2=IO6,3=IO5]>
+  if (s.startsWith("btnmap ")){
+    int btn,nid,lidx;
+    if (sscanf(s.c_str(),"btnmap %d %d %d",&btn,&nid,&lidx)==3 && btn>=1 && btn<=12){
+      BTNMAP[btn] = { (uint8_t)nid, (uint8_t)lidx, true };
+      Serial.printf("BTNMAP: Btn%d -> node=%d lampIdx=%d\n", btn, nid, lidx);
     } else {
-      Serial.println("usage: game start <seconds> <btn>");
+      Serial.println("usage: btnmap <btn 1..12> <nodeId> <lampIdx 1|2|3>");
     }
     return;
   }
@@ -846,6 +996,94 @@ static void handleCli(String s){
       return;
     }
     Serial.println("usage: tofvis on|off  OR  tofvis on <r> <g> <b>");
+    return;
+  }
+
+  if (s.startsWith("base plan ")){
+    const char* what = s.c_str() + 10;
+
+    // Build a unique node list from BaseConfig button pins
+    uint8_t nodes[16]; uint8_t nn=0;
+    auto addNode=[&](uint8_t id){ for(uint8_t i=0;i<nn;++i) if(nodes[i]==id) return; nodes[nn++]=id; };
+    for (size_t i=0;i<arrlen(kBaseBtnPins); ++i) addNode(kBaseBtnPins[i].nodeId);
+    for (auto &kv : nodesById) addNode(kv.first);  // include discovered nodes (e.g., 5)
+
+    Serial.println("// Copy-paste these to query live nodes; then paste outputs into BaseConfig:");
+    if (!strcmp(what,"ledmap") || !strcmp(what,"all")){
+      for (uint8_t i=0;i<nn;++i) Serial.printf("ledmap get %u\n", nodes[i]);
+      Serial.println();
+    }
+    if (!strcmp(what,"tofmap") || !strcmp(what,"all")){
+      for (uint8_t i=0;i<nn;++i) Serial.printf("tofmap get %u\n", nodes[i]);
+      Serial.println();
+    }
+    return;
+  }
+
+  // base capture <ledmap|tofmap|all>  -> prints BaseConfig arrays from captured RSPs
+  if (s.startsWith("base capture ")){
+    const char* what = s.c_str() + 13;
+    bool doLed = !strcmp(what,"ledmap") || !strcmp(what,"all");
+    bool doTof = !strcmp(what,"tofmap") || !strcmp(what,"all");
+
+    if (doLed){
+      size_t total = 0;
+      Serial.println("/* ---- Paste into BaseConfig: kBaseLedMap[] ---- */");
+      Serial.println("struct LedMapDef { uint8_t nodeId, strip, gpio; uint16_t count; };");
+      Serial.println("static const LedMapDef kBaseLedMap[] = {");
+      for (uint8_t nid=1;nid<8;nid++){
+        if (!capLed[nid].have || capLed[nid].n==0) continue;
+        for (uint8_t i=0;i<capLed[nid].n;i++){
+          Serial.printf("  { %u, %u, %u, %u },\n", nid, i, capLed[nid].pin[i], capLed[nid].count[i]);
+          total++;
+        }
+      }
+      Serial.println("};");
+      Serial.println("static const size_t kBaseLedMapCount = sizeof(kBaseLedMap)/sizeof(kBaseLedMap[0]);");
+      if (total==0) Serial.println("// (No LEDMAP captured yet; run 'base plan ledmap', execute those commands, then 'base capture ledmap')");
+      Serial.println();
+    }
+
+    if (doTof){
+      size_t total = 0;
+      Serial.println("/* ---- Paste into BaseConfig: kBaseTofMap[] ---- */");
+      Serial.println("struct TofMapDef { uint8_t nodeId; uint8_t g[8]; };");
+      Serial.println("static const TofMapDef kBaseTofMap[] = {");
+      for (uint8_t nid=1;nid<8;nid++){
+        if (!capTof[nid].have) continue;
+        auto &c = capTof[nid];
+        Serial.printf("  { %u, { %u,%u,%u,%u,%u,%u,%u,%u } },\n",
+                      nid, c.g[0],c.g[1],c.g[2],c.g[3],c.g[4],c.g[5],c.g[6],c.g[7]);
+        total++;
+      }
+      Serial.println("};");
+      Serial.println("static const size_t kBaseTofMapCount = sizeof(kBaseTofMap)/sizeof(kBaseTofMap[0]);");
+      if (total==0) Serial.println("// (No TOFMAP captured yet; run 'base plan tofmap', execute those commands, then 'base capture tofmap')");
+      Serial.println();
+    }
+    return;
+  }
+
+  // lamptest <nodeId>   -> blinks idx 1..3 quickly
+  if (s.startsWith("lamptest ")){
+    int nid=-1; if (sscanf(s.c_str(),"lamptest %d",&nid)==1){
+      for (int i=1;i<=3;i++){ sendLampCtrl((uint8_t)nid, (uint8_t)i, true);  delay(250);
+                              sendLampCtrl((uint8_t)nid, (uint8_t)i, false); delay(150); }
+      Serial.printf("lamptest done for node %d\n", nid);
+    } else Serial.println("usage: lamptest <nodeId>");
+    return;
+  }
+  // lampb <idx 1|2|3> <on|off>   -> broadcast LAMP_CTRL to all nodes
+  if (s.startsWith("lampb ")){
+    int idx; char onoff[8]={0};
+    if (sscanf(s.c_str(),"lampb %d %7s",&idx,onoff)==2 && idx>=1 && idx<=3){
+      LampCtrlMsg m{}; m.h={ LAMP_CTRL, PROTO_VER, 0,0, gSeq++, (uint16_t)sizeof(LampCtrlMsg) };
+      m.idx=idx; m.on = (String(onoff)=="on") ? 1 : 0;
+      sendRaw(kBroadcast, (uint8_t*)&m, sizeof(m));
+      Serial.printf("LAMPB broadcast idx=%d %s\n", idx, (m.on?"ON":"OFF"));
+    } else {
+      Serial.println("usage: lampb <idx 1|2|3> <on|off>");
+    }
     return;
   }
 
