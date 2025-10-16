@@ -9,6 +9,7 @@
 #include <WiFi.h>
 #include <esp_wifi.h>
 #include <esp_now.h>
+#include <esp_system.h>
 #include <Preferences.h>
 #include <Adafruit_NeoPixel.h>
 #include <HTTPClient.h>
@@ -30,7 +31,7 @@
 #endif
 // EXACT TEST PARITY: accept RS==0 only
 #undef  ACCEPT_RS5
-#define ACCEPT_RS5 0
+#define ACCEPT_RS5 1
 
 // ---------- Fixed pins (I2C / lamps defaults) ----------
 #define PIN_SDA 8
@@ -337,6 +338,7 @@ static void onNowRecv(const esp_now_recv_info* info, const uint8_t* data, int le
     }
     saveStripCfg(tmp, n);
     Serial.printf("[LED_MAP] saved %u strips; rebooting\n", n);
+    forceTofColdState();
     delay(100); ESP.restart();
     return;
   }
@@ -444,6 +446,24 @@ static void showOtaSuccess(){
   }
 }
 
+// --- I2C bus recovery: 9 SCL pulses + STOP to release a stuck slave ---
+static void i2cBusRecover(uint8_t sda=PIN_SDA, uint8_t scl=PIN_SCL){
+  pinMode(sda, INPUT_PULLUP);
+  pinMode(scl, OUTPUT);
+  // If SDA is low, clock until it releases
+  for (int i=0; i<9 && digitalRead(sda)==LOW; ++i){
+    digitalWrite(scl, HIGH); delayMicroseconds(8);
+    digitalWrite(scl, LOW);  delayMicroseconds(8);
+  }
+  // Generate STOP
+  pinMode(sda, OUTPUT);
+  digitalWrite(sda, LOW); delayMicroseconds(8);
+  digitalWrite(scl, HIGH); delayMicroseconds(8);
+  digitalWrite(sda, HIGH); delayMicroseconds(8);
+  // Restore
+  pinMode(sda, INPUT_PULLUP);
+}
+
 // ---------- ESP-NOW/OTA helpers ----------
 static void stopEspNow(){ esp_now_deinit(); }
 static esp_err_t startEspNow(){ if (esp_now_init()!=ESP_OK) return ESP_FAIL; esp_now_register_recv_cb(onNowRecv); esp_now_peer_info_t p{}; memcpy(p.peer_addr,kBroadcast,6); p.channel=6; p.encrypt=false; p.ifidx=WIFI_IF_STA; esp_now_add_peer(&p); return ESP_OK; }
@@ -463,7 +483,7 @@ static void performHttpOta(String url, String ssid, String pass){
   WiFiClient client; HTTPUpdate httpUpdate; httpUpdate.rebootOnUpdate(false);
   Serial.printf("[OTA] GET %s\n", url.c_str());
   t_httpUpdate_return r = httpUpdate.update(client, url);
-  if (r==HTTP_UPDATE_OK){ Serial.println("[OTA] OK, rebooting"); showOtaSuccess(); delay(400); ESP.restart(); }
+  if (r==HTTP_UPDATE_OK){ Serial.println("[OTA] OK, rebooting"); showOtaSuccess(); delay(400); forceTofColdState(); ESP.restart(); }
   else { Serial.printf("[OTA] Fail code=%d\n", (int)r); Serial.printf("[OTA] Error: %s\n", httpUpdate.getLastErrorString().c_str()); showOtaError(); esp_wifi_set_channel(6, WIFI_SECOND_CHAN_NONE); startEspNow(); gOtaMode = false; }
 }
 
@@ -492,7 +512,7 @@ VL53L4CX tof0(&DEV_I2C, 255), tof1(&DEV_I2C, 255), tof2(&DEV_I2C, 255), tof3(&DE
 VL53L4CX* TOF[NUM_SENSORS] = { &tof0,&tof1,&tof2,&tof3,&tof4,&tof5,&tof6,&tof7 };
 
 // ---------- EXACT TEST DETECTION CONFIG ----------
-static const uint16_t MIN_MM = 600, MAX_MM = 2000;
+static const uint16_t MIN_MM = 200, MAX_MM = 2400;
 static const uint8_t  MAX_ERR_BEFORE_REINIT = 4;
 static const unsigned long POLL_INTERVAL_MS = 60;
 
@@ -512,6 +532,19 @@ static void render(){
 
   ledDirty = false;
   nextShowAt = now + LED_MIN_INTERVAL_MS;
+}
+
+// --- Force every VL53L4CX into a known stopped state (no power cut needed) ---
+static void forceTofColdState(){
+#if TOF_ENABLED
+  for (uint8_t ch=0; ch<8; ++ch){
+    if (!tcaSelect(ch)) continue;
+    // Safe to call even if not running:
+    TOF[ch]->VL53L4CX_StopMeasurement();
+    tcaDeselectAll();
+    delay(2);
+  }
+#endif
 }
 
 // ---------- Button polling (dynamic) ----------
@@ -587,7 +620,6 @@ static void pollOne(uint8_t i) {
   unsigned long now = millis();
   if (now - lastRender < 1) {} // no-op, keep lastRender referenced if LTO prunes
   static unsigned long lastPollMs[NUM_SENSORS] = {0};
-  static unsigned long lastHeartbeatMs[NUM_SENSORS] = {0};
 
   if (now - lastPollMs[i] < POLL_INTERVAL_MS) return;
   lastPollMs[i] = now;
@@ -606,10 +638,6 @@ static void pollOne(uint8_t i) {
     return;
   }
   if (!ready) {
-    if (now - lastHeartbeatMs[i] > 1000) {
-      Serial.printf("[HB] ch%u: no new data yet\n", ch);
-      lastHeartbeatMs[i] = now;
-    }
     tcaDeselectAll();
     i2cBusy=false;
     return;
@@ -635,8 +663,6 @@ static void pollOne(uint8_t i) {
         mm = m;
         float sig = (float)data.RangeData[j].SignalRateRtnMegaCps / 65536.0f;
         float amb = (float)data.RangeData[j].AmbientRateRtnMegaCps / 65536.0f;
-        Serial.printf("ToF%u(ch%u): D=%u mm, Signal=%.3f, Ambient=%.3f\n",
-                      (unsigned)i, (unsigned)ch, (unsigned)mm, sig, amb);
         updated = true;
         break; // first valid object
       }
@@ -670,6 +696,13 @@ void setup(){
   delay(150);
   randomSeed(((uint32_t)ESP.getEfuseMac()) ^ micros());
 
+  esp_reset_reason_t rr = esp_reset_reason();
+  bool warmBoot = (rr != ESP_RST_POWERON && rr != ESP_RST_DEEPSLEEP);
+  if (warmBoot) {
+    Serial.printf("[BOOT] Warm reset (%d) – recovering I2C\n", (int)rr);
+    i2cBusRecover();                 // clock SCL to release a stuck slave
+  }
+
   // Lamps (guard if pins overlap strips)
   if (!pinUsedByStrip(PIN_LAMP1)) { pinMode(PIN_LAMP1, OUTPUT); digitalWrite(PIN_LAMP1, LOW); }
   if (!pinUsedByStrip(PIN_LAMP2)) { pinMode(PIN_LAMP2, OUTPUT); digitalWrite(PIN_LAMP2, LOW); }
@@ -682,8 +715,14 @@ void setup(){
   Wire.setTimeOut(20);
   delay(150);
   tcaDeselectAll();
+  if (warmBoot) {
+    forceTofColdState();             // stop all VL53s (no power cut needed)
+    tcaDeselectAll();
+  }
 
   WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+
   esp_wifi_set_channel(6, WIFI_SECOND_CHAN_NONE);
   if (esp_now_init()==ESP_OK){
     esp_now_register_send_cb(onNowSent);
