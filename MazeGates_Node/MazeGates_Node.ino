@@ -38,7 +38,6 @@
 #define PIN_SCL 9
 #define PIN_LAMP1 12
 #define PIN_LAMP2 6
-#define PIN_LAMP3 5
 
 // ---------- Dynamic LED strips (up to 5) ----------
 static const uint8_t MAX_STRIPS = 5;
@@ -321,9 +320,8 @@ static void onNowRecv(const esp_now_recv_info* info, const uint8_t* data, int le
   // Lamps (skip if lamp pin is used by a strip)
   if (h->type==LAMP_CTRL && len >= (int)sizeof(LampCtrlMsg)) {
     auto *m=(const LampCtrlMsg*)data;
-    if      (m->idx==1 && !pinUsedByStrip(PIN_LAMP1)) digitalWrite(PIN_LAMP1, m->on?HIGH:LOW);
+    if (m->idx==1 && !pinUsedByStrip(PIN_LAMP1)) digitalWrite(PIN_LAMP1, m->on?HIGH:LOW);
     else if (m->idx==2 && !pinUsedByStrip(PIN_LAMP2)) digitalWrite(PIN_LAMP2, m->on?HIGH:LOW);
-    else if (m->idx==3 && !pinUsedByStrip(PIN_LAMP3)) digitalWrite(PIN_LAMP3, m->on?HIGH:LOW); // <— new
     return;
   }
 
@@ -708,7 +706,6 @@ void setup(){
   // Lamps (guard if pins overlap strips)
   if (!pinUsedByStrip(PIN_LAMP1)) { pinMode(PIN_LAMP1, OUTPUT); digitalWrite(PIN_LAMP1, LOW); }
   if (!pinUsedByStrip(PIN_LAMP2)) { pinMode(PIN_LAMP2, OUTPUT); digitalWrite(PIN_LAMP2, LOW); }
-  if (!pinUsedByStrip(PIN_LAMP3)) { pinMode(PIN_LAMP3, OUTPUT); digitalWrite(PIN_LAMP3, LOW); }
 
   loadStripCfg(); applyStripCfg();
   loadBtnPins();  applyBtnPins();
