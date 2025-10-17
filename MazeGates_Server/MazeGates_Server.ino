@@ -2,7 +2,7 @@
  * Maze Gates – Server Harness v0 (clean compile)
  * Board: ESP32 (any), Transport: ESP-NOW ch.6
  * Full-field fan-out via GATE_MAP; CLI includes help, hello, roster, claim, setgate,
- * fakegate, walkable, pushwalkable, path set, lamp, ledmap (set/show), ota, ota all, status.
+ * fakegate, walkable, pushwalkable, path set, lamp, ledmap (set/show), ota, ota all, status. 
  */
 
 #include <Arduino.h>
