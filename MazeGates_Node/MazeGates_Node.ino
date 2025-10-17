@@ -29,7 +29,7 @@
 #ifndef TOF_ENABLED
 #define TOF_ENABLED 1
 #endif
-// EXACT TEST PARITY: accept RS==0 only
+
 #undef  ACCEPT_RS5
 #define ACCEPT_RS5 1
 
@@ -106,7 +106,7 @@ static void saveBtnPins(const uint8_t *pins, uint8_t n){
 static void loadBtnPins(){
   Preferences p; p.begin("maze", true);
   uint8_t n = p.getUChar("bN", 0);
-  if (n==0 || n>MAX_BTNS){ btnCount = 2; btnPins[0]=17; btnPins[1]=18; btnPins[2]=14; }
+  if (n==0 || n>MAX_BTNS){ btnCount = 3; btnPins[0]=17; btnPins[1]=18; btnPins[2]=14; }
   else {
     btnCount = n;
     for (uint8_t i=0;i<btnCount;i++){

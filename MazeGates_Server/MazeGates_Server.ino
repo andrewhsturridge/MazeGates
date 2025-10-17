@@ -120,20 +120,49 @@ static const GateMapEntry GATE_MAP[45] = {
   /*42*/ {5,3,  0,45},  /*43*/ {5,3, 45,45},  /*44*/ {5,3, 90,50},
 };
 
-// --- ToF visualization toggle ---
-static bool gTofVis = false;            // off by default
-static uint8_t gTofR = 0, gTofG = 0, gTofB = 255;  // ENTER color (blue)
+// ======= Default Button → Lamp map (no CLI needed) =======
+// Btn index = 1..12. Each maps to a (nodeId, lampIdx 1..3).
+// Assumption: local button index == lamp index on that node.
+struct BtnMapEntry { uint8_t nodeId; uint8_t lampIdx; };
 
-// Global button mapping: B# -> (nodeId, localIdx)
-struct BtnSig { uint8_t nodeId; uint8_t localIdx; bool valid; };
-static BtnSig BTN_SIG[13] = {}; // 1..12 used
+// Index 0 unused for convenience
+static const BtnMapEntry BTN_DEFAULT[13] = {
+  /*0*/  {0,0},
 
-static int resolveGlobalBtn(uint8_t nodeId, uint8_t localIdx){
-  for (int b=1;b<=12;b++){
-    if (BTN_SIG[b].valid && BTN_SIG[b].nodeId==nodeId && BTN_SIG[b].localIdx==localIdx) return b;
+  // B1..B12 (from your spec):
+  /*1*/  {4,1},  // B1  -> ESP 4, IO17 -> lampIdx 1
+  /*2*/  {4,2},  // B2  -> ESP 4, IO18 -> lampIdx 2
+  /*3*/  {1,1},  // B3  -> ESP 1, IO17 -> lampIdx 1
+  /*4*/  {1,2},  // B4  -> ESP 1, IO18 -> lampIdx 2
+  /*5*/  {1,3},  // B5  -> ESP 1, IO14 -> lampIdx 3
+  /*6*/  {2,1},  // B6  -> ESP 2, IO17 -> lampIdx 1
+  /*7*/  {2,2},  // B7  -> ESP 2, IO18 -> lampIdx 2
+  /*8*/  {3,1},  // B8  -> ESP 3, IO17 -> lampIdx 1
+  /*9*/  {3,2},  // B9  -> ESP 3, IO18 -> lampIdx 2
+  /*10*/ {3,3},  // B10 -> ESP 3, IO14 -> lampIdx 3
+  /*11*/ {6,1},  // B11 -> ESP 6, IO17 -> lampIdx 1
+  /*12*/ {6,2},  // B12 -> ESP 6, IO18 -> lampIdx 2
+};
+
+// Get default (node,lampIdx) for a global button 1..12
+static inline bool getDefaultBtnLamp(uint8_t btn, uint8_t &nodeId, uint8_t &lampIdx){
+  if (btn < 1 || btn > 12) return false;
+  nodeId = BTN_DEFAULT[btn].nodeId;
+  lampIdx = BTN_DEFAULT[btn].lampIdx;
+  return nodeId != 0;
+}
+
+// Reverse-lookup: from (nodeId, localIdx==lampIdx) to global B#
+static inline int defaultGlobalBtnFrom(uint8_t nodeId, uint8_t localIdx){
+  for (uint8_t b=1; b<=12; ++b){
+    if (BTN_DEFAULT[b].nodeId == nodeId && BTN_DEFAULT[b].lampIdx == localIdx) return b;
   }
   return -1;
 }
+
+// --- ToF visualization toggle ---
+static bool gTofVis = false;            // off by default
+static uint8_t gTofR = 0, gTofG = 0, gTofB = 255;  // ENTER color (blue)
 
 // ======= Game state =======
 enum GameState { WAITING=0, PLAYING=1, GAME_OVER=2 };
@@ -146,23 +175,24 @@ struct Round {
 };
 static Round G{WAITING, 0, 0, 0};
 
-// Button lamp mapping: btn -> (node,lampIdx)
+// Button lamp mapping: btn 1..12 -> (node,lampIdx)
 struct BtnLamp { uint8_t nodeId; uint8_t lampIdx; bool valid; };
-static BtnLamp BTNMAP[6] = {}; // 1..5 used
+static BtnLamp BTNMAP[13] = {}; // index 1..12 used
 
-// Turn all configured lamps ON/OFF
+// Debug: optional press->pulse for mapped lamps
+static bool gBtnEcho = false;
+static uint32_t lampPulseUntil[13] = {}; // per B#, 0 = inactive
+static const uint16_t BTN_PULSE_MS = 200;
+
 static void setAllLamps(bool on){
-  for (uint8_t b=1; b<=5; ++b){
-    if (!BTNMAP[b].valid) continue;
-    sendLampCtrl(BTNMAP[b].nodeId, BTNMAP[b].lampIdx, on);
+  for (uint8_t btn=1; btn<=12; ++btn){
+    uint8_t nid, lidx;
+    if (getDefaultBtnLamp(btn, nid, lidx)) sendLampCtrl(nid, lidx, on);
   }
 }
-
-// Turn only the target lamp ON/OFF
 static void setTargetLamp(uint8_t btn, bool on){
-  if (btn>=1 && btn<=5 && BTNMAP[btn].valid){
-    sendLampCtrl(BTNMAP[btn].nodeId, BTNMAP[btn].lampIdx, on);
-  }
+  uint8_t nid, lidx;
+  if (getDefaultBtnLamp(btn, nid, lidx)) sendLampCtrl(nid, lidx, on);
 }
 
 // Quick helper: paint every (node,strip) to a color once (using GATE_MAP extents)
@@ -444,21 +474,37 @@ static void onNowRecv(const esp_now_recv_info* info, const uint8_t* data, int le
     auto *m=(const OtaAckMsg*)data;
     Serial.printf("OTA_ACK from node %u (status=%u)\n", h->nodeId, m->status);
   }
-  else if (h->type==BUTTON_EVENT && len>=(int)sizeof(ButtonEventMsg)){
-    auto *m=(const ButtonEventMsg*)data;
+  else if (h->type==BUTTON_EVENT && len >= (int)sizeof(ButtonEventMsg)){
+    const ButtonEventMsg* m = (const ButtonEventMsg*)data;
     Serial.printf("BUTTON%u %s from node %u\n",
                   m->btnIdx, (m->ev==1?"PRESS":"RELEASE"), h->nodeId);
-    int globalB = resolveGlobalBtn(h->nodeId, m->btnIdx);
-    if (globalB > 0) {
-      Serial.printf("  => B%d\n", globalB);
-      // If you added game state earlier:
-      if (G.st == PLAYING && m->ev==1 /*PRESS*/){
-        if (globalB == G.targetBtn) gameEnd(true);
-        else { paintAll(150,0,0); Serial.println("[GAME] Wrong button (penalty)"); }
+
+    // Resolve to global button using defaults (no dynamic mapping)
+    const int globalB = defaultGlobalBtnFrom(h->nodeId, m->btnIdx);
+    if (globalB > 0) Serial.printf("  => B%d (default)\n", globalB);
+
+    // Echo pulse on PRESS using defaults (if enabled)
+    if (gBtnEcho && m->ev == 1 /*PRESS*/){
+      if (globalB >= 1 && globalB <= 12){
+        uint8_t nid,lidx;
+        if (getDefaultBtnLamp((uint8_t)globalB, nid, lidx)){
+          sendLampCtrl(nid, lidx, true);
+          lampPulseUntil[globalB] = millis() + BTN_PULSE_MS;
+        }
       }
     }
 
+    // Gameplay reacts only to PRESS during PLAYING
+    if (G.st == PLAYING && m->ev == 1 /*PRESS*/){
+      if (globalB > 0 && globalB == G.targetBtn) {
+        gameEnd(true);
+      } else {
+        paintAll(150,0,0);  // penalty overlay (one-shot)
+        Serial.println("[GAME] Wrong button (penalty)");
+      }
+    }
   }
+
   else if (h->type == NODE_STATUS && len >= (int)sizeof(NodeStatusMsg)) {
     const NodeStatusMsg* m = (const NodeStatusMsg*)data;
     lastStatus[h->nodeId] = { m->uptimeMs, m->initedMask, m->errStreakMax, {0}, millis() };
@@ -474,23 +520,6 @@ static void onNowRecv(const esp_now_recv_info* info, const uint8_t* data, int le
         pos += snprintf(line+pos, sizeof(line)-pos, "%s%u:%u", (i? ", " : ""), r->e[i].pin, r->e[i].count);
       }
       qlogf("%s", line);
-    }
-  }
-  else if (h->type==BUTTON_EVENT && len>=(int)sizeof(ButtonEventMsg)){
-    auto *m=(const ButtonEventMsg*)data;
-    Serial.printf("BUTTON%u %s from node %u\n",
-                  m->btnIdx, (m->ev==1?"PRESS":"RELEASE"), h->nodeId);
-
-    // Only act on PRESS during PLAYING
-    if (G.st == PLAYING && m->ev == 1 /*PRESS*/){
-      if (m->btnIdx == G.targetBtn){
-        // WIN
-        gameEnd(true);
-      } else {
-        // Penalty overlay (single all-red overlay); baseline remains
-        paintAll(150,0,0);
-        Serial.println("[GAME] Wrong button (penalty overlay)");
-      }
     }
   }
   else if (h->type == BTN_PINS_RSP && len >= (int)sizeof(BtnPinsRsp)) {
@@ -520,7 +549,8 @@ static void printHelp(){
   Serial.println("  walkable clear | add <ids> | show");
   Serial.println("  pushwalkable");
   Serial.println("  path set <ids>");
-  Serial.println("  btnmap <btn> <nodeId> <lampIdx>");
+  Serial.println("  btnmap <btn> <nodeId> <lampIdx>   | btnmap show | btnmap clear <btn|all>");
+  Serial.println("  btnlamp <btn> <on|off>            | btnlamptest [ms] | btnlamp echo on|off");
   Serial.println("  game start <seconds> <btn>");
   Serial.println("  game end");
   Serial.println("  lamp <nodeId> <idx> <on|off>");
@@ -768,15 +798,72 @@ static void handleCli(String s){
     return;
   }
 
-  // btnmap <btn> <nodeId> <lampIdx>
-  if (s.startsWith("btnmap ")){
-    int btn,nid,lidx;
-    if (sscanf(s.c_str(),"btnmap %d %d %d",&btn,&nid,&lidx)==3 && btn>=1 && btn<=5){
+  if (s.startsWith("btnmap")){
+    // normalize
+    s.replace("\r",""); s.replace("\n",""); s.trim();
+
+    if (s=="btnmap show"){
+      Serial.println("BTN  node  lampIdx");
+      for (int b=1;b<=12;b++){
+        if (BTNMAP[b].valid) Serial.printf("%-3d %-5u %u\n", b, BTNMAP[b].nodeId, BTNMAP[b].lampIdx);
+      }
+      return;
+    }
+    if (s=="btnmap clear all"){
+      for (int b=1;b<=12;b++) BTNMAP[b].valid=false;
+      Serial.println("BTNMAP cleared");
+      return;
+    }
+    int btn=-1;
+    if (sscanf(s.c_str(),"btnmap clear %d",&btn)==1 && btn>=1 && btn<=12){
+      BTNMAP[btn].valid=false;
+      Serial.printf("BTNMAP: Btn%d cleared\n", btn);
+      return;
+    }
+    int nid=-1,lidx=-1;
+    if (sscanf(s.c_str(),"btnmap %d %d %d",&btn,&nid,&lidx)==3 && btn>=1 && btn<=12){
       BTNMAP[btn] = { (uint8_t)nid, (uint8_t)lidx, true };
       Serial.printf("BTNMAP: Btn%d -> node=%d lampIdx=%d\n", btn, nid, lidx);
-    } else {
-      Serial.println("usage: btnmap <btn> <nodeId> <lampIdx>");
+      return;
     }
+    Serial.println("usage: btnmap <btn 1..12> <nodeId> <lampIdx 1..3> | btnmap show | btnmap clear <btn|all>");
+    return;
+  }
+
+  // btnlamp echo on|off   -> pulse mapped lamp on PRESS via defaults
+  if (s.startsWith("btnlamp echo ")){
+    char onoff[8]={0};
+    if (sscanf(s.c_str(),"btnlamp echo %7s", onoff)==1){
+      gBtnEcho = (String(onoff)=="on");
+      Serial.printf("btnlamp echo: %s\n", gBtnEcho?"ON":"OFF");
+    } else Serial.println("usage: btnlamp echo on|off");
+    return;
+  }
+
+  // btnlamp <btn> <on|off>   -> manual control via default map
+  if (s.startsWith("btnlamp ")){
+    int btn=0; char onoff[8]={0};
+    if (sscanf(s.c_str(),"btnlamp %d %7s",&btn,onoff)==2 && btn>=1 && btn<=12){
+      uint8_t nid,lidx;
+      if (getDefaultBtnLamp((uint8_t)btn, nid, lidx)){
+        bool on = (String(onoff)=="on");
+        sendLampCtrl(nid, lidx, on);
+        Serial.printf("btnlamp Btn%d %s\n", btn, on?"ON":"OFF");
+      } else Serial.println("btnlamp: no default mapping for that button");
+    } else Serial.println("usage: btnlamp <btn 1..12> <on|off>");
+    return;
+  }
+
+  // btnlamptest [ms]   -> cycle through default-mapped lamps
+  if (s.startsWith("btnlamptest")){
+    int ms=200; sscanf(s.c_str(),"btnlamptest %d",&ms);
+    if (ms<50) ms=50; if (ms>2000) ms=2000;
+    for (int b=1;b<=12;b++){
+      uint8_t nid,lidx; if (!getDefaultBtnLamp((uint8_t)b, nid, lidx)) continue;
+      sendLampCtrl(nid, lidx, true);  delay(ms);
+      sendLampCtrl(nid, lidx, false); delay(50);
+    }
+    Serial.println("btnlamptest done");
     return;
   }
 
@@ -813,25 +900,6 @@ static void handleCli(String s){
     return;
   }
 
-  // btnsig set <B#> <nodeId> <localIdx>
-  if (s.startsWith("btnsig set ")){
-    int b,nid,idx;
-    if (sscanf(s.c_str(),"btnsig set %d %d %d",&b,&nid,&idx)==3 && b>=1 && b<=12){
-      BTN_SIG[b]={ (uint8_t)nid, (uint8_t)idx, true };
-      Serial.printf("BTNSIG: B%d -> node=%d local=%d\n", b, nid, idx);
-    } else Serial.println("usage: btnsig set <B#> <nodeId> <localIdx>");
-    return;
-  }
-
-  // btnsig show
-  if (s=="btnsig show"){
-    Serial.println("B#  node  localIdx");
-    for (int b=1;b<=12;b++){
-      if (BTN_SIG[b].valid) Serial.printf("%-3d %-5u %u\n", b, BTN_SIG[b].nodeId, BTN_SIG[b].localIdx);
-    }
-    return;
-  }
-
   // tofvis on|off [r g b]
   if (s.startsWith("tofvis")){
     int r=0,g=0,b=255;
@@ -859,6 +927,16 @@ static void handleCli(String s){
 void loop(){
   dripPump();
   flushLogs();
+
+  // Auto-off for echo pulses
+  uint32_t nowMs = millis();
+  for (uint8_t b=1; b<=12; ++b){
+    if (lampPulseUntil[b] && nowMs >= lampPulseUntil[b]){
+      uint8_t nid,lidx;
+      if (getDefaultBtnLamp(b, nid, lidx)) sendLampCtrl(nid, lidx, false);
+      lampPulseUntil[b] = 0;
+    }
+  }
 
   // Timeout?
   if (G.st == PLAYING && G.deadlineMs > 0 && (millis() - G.t0) > G.deadlineMs){
