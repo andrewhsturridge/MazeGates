@@ -231,16 +231,6 @@ static volatile uint8_t  rcNT         = 0;
 static volatile uint8_t  rcTargets[12];
 static volatile uint8_t  rcWalkBits[6];
 
-
-// Utility: fill all strips (used for overlays/clear)
-static void fillAllStrips(uint8_t r, uint8_t g, uint8_t b){
-  for (uint8_t i=0;i<stripCount;i++){
-    if (!strips[i]) continue;
-    for (uint16_t p=0;p<cfg[i].count;p++) strips[i]->setPixelColor(p, strips[i]->Color(r,g,b));
-    strips[i]->show();
-  }
-}
-
 // ---------- ESP-NOW ----------
 static volatile bool gOtaPending = false;
 static char gOtaUrlBuf[200] = {0};
@@ -338,31 +328,29 @@ static void onNowRecv(const esp_now_recv_info* info, const uint8_t* data, int le
   if (!info || len < (int)sizeof(PktHeader)) return; auto *h=(const PktHeader*)data;
   if (h->version!=PROTO_VER) return;
 
-  // GAME_STATE: mark pending state (apply in loop before any work)
   if (h->type == GAME_STATE && len >= (int)sizeof(GameStateMsg)){
     const GameStateMsg* m = (const GameStateMsg*)data;
 
-    // Stage for loop (keeps your architecture)
-    pendingEpoch = h->pad;
-    pendingState = (m->state==NODE_PLAYING) ? NODE_PLAYING
-                : (m->state==NODE_OVER)    ? NODE_OVER
-                                            : NODE_IDLE;
-    pendingR = m->r; pendingG = m->g; pendingB = m->b;
-    statePending = true;
+    // Adopt epoch and state *now*
+    currentEpoch = h->pad;
+    nodeState = (m->state == NODE_PLAYING) ? NODE_PLAYING
+            : (m->state == NODE_OVER)    ? NODE_OVER
+                                          : NODE_IDLE;
 
-    // **Immediate visual effect** so end overlay never gets missed
-    if (pendingState == NODE_PLAYING){
-      // clear any prior overlay
-      fillAllStrips(0,0,0);
+    // Hard stop paints after end: LED_RANGE will be ignored when not PLAYING
+    // Draw solid overlay immediately (buffered; render will show)
+    if (nodeState == NODE_PLAYING){
+      fillAllStrips(0,0,0);                // clear any previous overlay
     } else {
-      // freeze: nuke any pending LED paints & show solid overlay now
-      // If you still use a single-pending LED flag:
-      // ledPending = false;
-      // If you use a small LED queue instead, clear it here:
-      // ledQHead = ledQTail;
-
-      fillAllStrips(pendingR, pendingG, pendingB);  // e.g., red on loss, green on win
+      fillAllStrips(m->r, m->g, m->b);     // win→green, loss→red (from server)
     }
+
+    // If you still keep pending vars for loop, you can sync them here (optional):
+    pendingEpoch = currentEpoch;
+    pendingState = nodeState;
+    pendingR = m->r; pendingG = m->g; pendingB = m->b;
+    statePending = false;   // we've already applied it
+
     return;
   }
 
@@ -393,15 +381,17 @@ static void onNowRecv(const esp_now_recv_info* info, const uint8_t* data, int le
     return;
   }
 
-  // LED_RANGE: store last command; loop applies if PLAYING & epoch matches
+  // LED_RANGE: ignore unless actively playing
   if (h->type == LED_RANGE && len >= (int)sizeof(LedRangeMsg)) {
+    if (nodeState != NODE_PLAYING) return;
     const LedRangeMsg* m = (const LedRangeMsg*)data;
-    ledP_strip = m->strip;
-    ledP_start = m->start;
-    ledP_count = m->count;
-    ledP_r = m->r; ledP_g = m->g; ledP_b = m->b;
-    ledP_epoch = h->pad;      // 0 if server doesn't tag epochs
-    ledPending = true;
+    if (m->strip < stripCount && strips[m->strip]) {
+      uint16_t end = m->start + m->count;
+      if (end > cfg[m->strip].count) end = cfg[m->strip].count;
+      for (uint16_t i=m->start; i<end; ++i)
+        strips[m->strip]->setPixelColor(i, strips[m->strip]->Color(m->r,m->g,m->b));
+      ledDirty = true;
+    }
     return;
   }
 
@@ -665,14 +655,28 @@ static const unsigned long POLL_INTERVAL_MS = 60;
 // ---------- Render ----------
 static bool i2cBusy=false;
 
+// Buffered solid fill across all configured strips (no show() here)
+static void fillAllStrips(uint8_t r, uint8_t g, uint8_t b){
+  for (uint8_t i=0; i<stripCount; i++){
+    if (!strips[i]) continue;
+    for (uint16_t p=0; p<cfg[i].count; p++){
+      strips[i]->setPixelColor(p, strips[i]->Color(r,g,b));
+    }
+  }
+  ledDirty = true;     // request a render
+  nextShowAt = 0;      // force renderer on next loop tick
+}
+
+// Renderer flush (called from loop)
 static void render(){
-  static volatile bool _ledDirty = false; // shadow to allow set/clear
-  // use global ledDirty
-  if (!ledDirty) return;
-  if (i2cBusy) return;
+  if (!ledDirty) return;         // only show when pixels changed
+  if (i2cBusy) return;           // never render during I2C (protect ToF)
   uint32_t now = millis();
-  if (now < nextShowAt) return;
-  for (uint8_t i=0;i<stripCount;i++) if (strips[i]) strips[i]->show();
+  if (now < nextShowAt) return;  // fps cap
+
+  for (uint8_t i=0; i<stripCount; i++){
+    if (strips[i]) strips[i]->show();
+  }
   ledDirty = false;
   nextShowAt = now + LED_MIN_INTERVAL_MS;
 }
