@@ -17,6 +17,8 @@
 #include <Update.h>
 #include "vl53l4cx_class.h"   // STM32duino VL53L4CX by ST
 
+#include "MazeGates_Map.h"
+
 // ---------- OTA defaults ----------
 #ifndef OTA_SSID
 #define OTA_SSID "GUD"
@@ -26,10 +28,6 @@
 #endif
 
 // ---------- Feature switches ----------
-#ifndef TOF_ENABLED
-#define TOF_ENABLED 1
-#endif
-
 #undef  ACCEPT_RS5
 #define ACCEPT_RS5 1
 
@@ -151,10 +149,28 @@ enum MsgType : uint8_t {
   NODE_STATUS=60,
   LED_MAP=62, LED_MAP_REQ=63, LED_MAP_RSP=64,
   BTN_PINS=70, BTN_PINS_REQ=71, BTN_PINS_RSP=72,
-  TOF_MAP = 80, TOF_MAP_REQ = 81, TOF_MAP_RSP = 82
+  TOF_MAP = 80, TOF_MAP_REQ = 81, TOF_MAP_RSP = 82,
+  GAME_STATE  = 90, ROUND_CFG = 92
 };
+
+enum NodeGameState : uint8_t { NODE_IDLE=0, NODE_PLAYING=1, NODE_OVER=2 };
+static volatile uint8_t nodeState = NODE_IDLE;
+
 struct __attribute__((packed)) PktHeader { uint8_t type, version, nodeId, pad; uint16_t seq, len; };
 static const uint8_t PROTO_VER = 1;
+
+struct __attribute__((packed)) GameStateMsg {
+  PktHeader h;
+  uint8_t state;  // NodeGameState
+  uint8_t r,g,b;  // overlay color to apply when not PLAYING
+};
+
+struct __attribute__((packed)) RoundCfgMsg {
+  PktHeader h;            // h.pad carries epoch (optional)
+  uint8_t   nTargets;     // 0..12
+  uint8_t   targets[12];  // global Btn indices (1..12)
+  uint8_t   walkBits[6];  // 44 gates -> 44 bits (LSB = gate1)
+};
 
 struct __attribute__((packed)) HelloMsg { PktHeader h; uint8_t role; uint8_t caps; };
 struct __attribute__((packed)) ClaimMsg { PktHeader h; uint8_t newNodeId; };
@@ -183,6 +199,47 @@ struct __attribute__((packed)) BtnPinsMsg {
 struct __attribute__((packed)) BtnPinsRsp {
   PktHeader h; uint8_t n; uint8_t pin[3];
 };
+
+// ---------- Simple pending-work flags (no queues) ----------
+
+// Apply GAME_STATE in loop (set by onNowRecv)
+static volatile bool     statePending  = false;
+static volatile uint8_t  pendingEpoch  = 0;
+static volatile uint8_t  pendingState  = NODE_IDLE;
+static volatile uint8_t  pendingR=0, pendingG=0, pendingB=0;
+
+// Current epoch (optional; adopted from header.pad)
+static volatile uint8_t  currentEpoch  = 0;
+
+// Lamps: desired ON/OFF per idx, and which indices are dirty
+// bit0 -> idx1, bit1 -> idx2, bit2 -> idx3
+static volatile uint8_t  lampDesiredMask = 0;   // target state
+static volatile uint8_t  lampDirtyMask   = 0;   // which to apply
+
+// One pending LED_RANGE (last-wins)
+static volatile bool     ledPending   = false;
+static volatile uint8_t  ledP_strip   = 0;
+static volatile uint16_t ledP_start   = 0;
+static volatile uint16_t ledP_count   = 0;
+static volatile uint8_t  ledP_r=0, ledP_g=0, ledP_b=0;
+static volatile uint8_t  ledP_epoch   = 0;
+
+// Round config
+static volatile bool     rcPending    = false;
+static volatile uint8_t  rcEpoch      = 0;
+static volatile uint8_t  rcNT         = 0;
+static volatile uint8_t  rcTargets[12];
+static volatile uint8_t  rcWalkBits[6];
+
+
+// Utility: fill all strips (used for overlays/clear)
+static void fillAllStrips(uint8_t r, uint8_t g, uint8_t b){
+  for (uint8_t i=0;i<stripCount;i++){
+    if (!strips[i]) continue;
+    for (uint16_t p=0;p<cfg[i].count;p++) strips[i]->setPixelColor(p, strips[i]->Color(r,g,b));
+    strips[i]->show();
+  }
+}
 
 // ---------- ESP-NOW ----------
 static volatile bool gOtaPending = false;
@@ -216,12 +273,10 @@ static void pumpTx(){
   }
 }
 static void onNowSent(const wifi_tx_info_t* info, esp_now_send_status_t status) {
-  // (optional) inspect info->dest_addr, info->pkt_len, etc.
   pumpTx();  // kick the TX queue again
 }
 
 static void sendRaw(const uint8_t* mac, const uint8_t* data, size_t len){
-  // Try immediate; fall back to queue if radio is momentarily full.
   if (esp_now_send(mac, data, len) == ESP_OK) return;
   enqueueTx(data, (uint8_t)((len > 64) ? 64 : len));
 }
@@ -270,7 +325,6 @@ static void sendNodeStatus() {
   }
   m.initedMask   = mask;
   m.errStreakMax = maxErr;
-  // reinitCount optional; zero by default unless you wire it up further
   sendRaw(kBroadcast, (uint8_t*)&m, sizeof(m));
 }
 
@@ -283,6 +337,45 @@ static const uint32_t LED_MIN_INTERVAL_MS = 40;  // ~25 fps max, tweakable
 static void onNowRecv(const esp_now_recv_info* info, const uint8_t* data, int len){
   if (!info || len < (int)sizeof(PktHeader)) return; auto *h=(const PktHeader*)data;
   if (h->version!=PROTO_VER) return;
+
+  // GAME_STATE: mark pending state (apply in loop before any work)
+  if (h->type == GAME_STATE && len >= (int)sizeof(GameStateMsg)){
+    const GameStateMsg* m = (const GameStateMsg*)data;
+
+    // Stage for loop (keeps your architecture)
+    pendingEpoch = h->pad;
+    pendingState = (m->state==NODE_PLAYING) ? NODE_PLAYING
+                : (m->state==NODE_OVER)    ? NODE_OVER
+                                            : NODE_IDLE;
+    pendingR = m->r; pendingG = m->g; pendingB = m->b;
+    statePending = true;
+
+    // **Immediate visual effect** so end overlay never gets missed
+    if (pendingState == NODE_PLAYING){
+      // clear any prior overlay
+      fillAllStrips(0,0,0);
+    } else {
+      // freeze: nuke any pending LED paints & show solid overlay now
+      // If you still use a single-pending LED flag:
+      // ledPending = false;
+      // If you use a small LED queue instead, clear it here:
+      // ledQHead = ledQTail;
+
+      fillAllStrips(pendingR, pendingG, pendingB);  // e.g., red on loss, green on win
+    }
+    return;
+  }
+
+  if (h->type == ROUND_CFG && len >= (int)sizeof(RoundCfgMsg)){
+    const RoundCfgMsg* r = (const RoundCfgMsg*)data;
+    rcEpoch = h->pad;
+    rcNT    = r->nTargets;
+    if (rcNT > 12) rcNT = 12;
+    for (uint8_t i=0;i<rcNT;i++) rcTargets[i] = r->targets[i];
+    for (uint8_t i=0;i<6;i++)    rcWalkBits[i] = r->walkBits[i];
+    rcPending = true;     // loop will apply atomically
+    return;
+  }
 
   if (h->type==HELLO_REQ){
     uint32_t jitter = (uint32_t)random(20, 181);   // 20–180 ms
@@ -300,26 +393,26 @@ static void onNowRecv(const esp_now_recv_info* info, const uint8_t* data, int le
     return;
   }
 
-  // LED paint (clamped, dynamic)
+  // LED_RANGE: store last command; loop applies if PLAYING & epoch matches
   if (h->type == LED_RANGE && len >= (int)sizeof(LedRangeMsg)) {
-    auto *m = (const LedRangeMsg*)data;
-    if (m->strip < stripCount && strips[m->strip]) {
-      uint16_t end = m->start + m->count;
-      uint16_t cap = cfg[m->strip].count;
-      if (end > cap) end = cap;
-      for (uint16_t i = m->start; i < end; ++i)
-        strips[m->strip]->setPixelColor(i, strips[m->strip]->Color(m->r, m->g, m->b));
-    }
-    ledDirty = true;
+    const LedRangeMsg* m = (const LedRangeMsg*)data;
+    ledP_strip = m->strip;
+    ledP_start = m->start;
+    ledP_count = m->count;
+    ledP_r = m->r; ledP_g = m->g; ledP_b = m->b;
+    ledP_epoch = h->pad;      // 0 if server doesn't tag epochs
+    ledPending = true;
     return;
   }
 
-  // Lamps (skip if lamp pin is used by a strip)
+  // LAMP_CTRL: set desired bit and mark dirty (always honored)
   if (h->type==LAMP_CTRL && len >= (int)sizeof(LampCtrlMsg)) {
-    auto *m=(const LampCtrlMsg*)data;
-    if (m->idx==1) digitalWrite(PIN_LAMP1, m->on?HIGH:LOW);
-    else if (m->idx==2) digitalWrite(PIN_LAMP2, m->on?HIGH:LOW);
-    else if (m->idx==3) digitalWrite(PIN_LAMP3, m->on?HIGH:LOW);
+    const LampCtrlMsg* m=(const LampCtrlMsg*)data;
+    if (m->idx>=1 && m->idx<=3){
+      uint8_t bit = (1u << (m->idx-1));
+      if (m->on) lampDesiredMask |=  bit; else lampDesiredMask &= ~bit;
+      lampDirtyMask |= bit;   // schedule apply in loop
+    }
     return;
   }
 
@@ -374,7 +467,7 @@ static void onNowRecv(const esp_now_recv_info* info, const uint8_t* data, int le
     return;
   }
 
-  // Set ToF map: 8 bytes ch0..7 -> gateId (0 means unused)
+  // Set ToF map
   if (h->type == TOF_MAP && len >= (int)sizeof(TofMapMsg)){
     auto *m = (const TofMapMsg*)data;
     memcpy(tofGateByCh, m->g, 8);
@@ -393,7 +486,6 @@ static void onNowRecv(const esp_now_recv_info* info, const uint8_t* data, int le
     memcpy(r.g, tofGateByCh, 8); sendRaw(kBroadcast,(uint8_t*)&r,sizeof(r));
     return;
   }
-
 }
 
 // ---------- OTA visuals (dynamic across all strips) ----------
@@ -441,6 +533,62 @@ static void showOtaSuccess(){
     if (!strips[i]) continue;
     for (uint16_t p=0;p<cfg[i].count;p++) strips[i]->setPixelColor(p, strips[i]->Color(0,150,0));
     strips[i]->show();
+  }
+}
+
+static inline bool bitsetGet(const uint8_t* bits, uint8_t gate1to44){
+  if (gate1to44 < 1 || gate1to44 > 44) return false;
+  uint8_t i = (uint8_t)((gate1to44-1) >> 3);
+  uint8_t b = (uint8_t)((gate1to44-1) & 7);
+  return (bits[i] >> b) & 1u;
+}
+
+static void nodePaintWalkable(const uint8_t* walkBits){
+  // Compute max extent for THIS node's strips
+  uint16_t maxLen[8] = {0,0,0,0,0,0,0,0};
+  for (uint8_t g=1; g<=44; ++g){
+    const auto &e = GATE_MAP[g];
+    if (e.nodeId != gNodeId) continue;
+    uint16_t end = e.start + e.count;
+    if (end > maxLen[e.strip]) maxLen[e.strip] = end;
+  }
+
+  // Base coat RED per used strip
+  for (uint8_t s=0; s<8; ++s){
+    if (s >= stripCount || !strips[s]) continue;
+    uint16_t cnt = maxLen[s]; if (!cnt) continue;
+    for (uint16_t p=0; p<cnt; ++p)
+      strips[s]->setPixelColor(p, strips[s]->Color(150,0,0));
+  }
+
+  // Overlay GREEN for walkables (only our gates)
+  for (uint8_t g=1; g<=44; ++g){
+    const auto &e = GATE_MAP[g];
+    if (e.nodeId != gNodeId) continue;
+    bool ok = bitsetGet(walkBits, g);
+    uint32_t color = strips[e.strip]->Color(ok?0:150, ok?150:0, 0);
+    uint16_t end = e.start + e.count;
+    if (e.strip >= stripCount || !strips[e.strip]) continue;
+    uint16_t cap = cfg[e.strip].count; if (end > cap) end = cap;
+    for (uint16_t i=e.start; i<end; ++i)
+      strips[e.strip]->setPixelColor(i, color);
+  }
+
+  ledDirty = true; // render() will show()
+}
+
+static void applyTargetsOnThisNode(uint8_t nTargets, const uint8_t* targets){
+  // Clear all lamp outputs first
+  lampDesiredMask = 0;
+  lampDirtyMask   = 0x07; // mark all 3 indices dirty -> will set below
+
+  for (uint8_t i=0; i<nTargets && i<12; ++i){
+    uint8_t b = targets[i];
+    if (b < 1 || b > 12) continue;
+    const BtnMapEntry &m = BTN_DEFAULT[b];
+    if (m.nodeId == gNodeId && m.lampIdx>=1 && m.lampIdx<=3){
+      lampDesiredMask |= (1u << (m.lampIdx-1));
+    }
   }
 }
 
@@ -515,34 +663,28 @@ static const uint8_t  MAX_ERR_BEFORE_REINIT = 4;
 static const unsigned long POLL_INTERVAL_MS = 60;
 
 // ---------- Render ----------
-static const uint32_t RENDER_MS = 33;
-static uint32_t lastRender=0;
 static bool i2cBusy=false;
 
 static void render(){
-  if (!ledDirty) return;         // only show when pixels really changed
-  if (i2cBusy) return;           // never render during I2C (protect ToF)
+  static volatile bool _ledDirty = false; // shadow to allow set/clear
+  // use global ledDirty
+  if (!ledDirty) return;
+  if (i2cBusy) return;
   uint32_t now = millis();
-  if (now < nextShowAt) return;  // cap frame rate
-
-  for (uint8_t i=0;i<stripCount;i++)
-    if (strips[i]) strips[i]->show();
-
+  if (now < nextShowAt) return;
+  for (uint8_t i=0;i<stripCount;i++) if (strips[i]) strips[i]->show();
   ledDirty = false;
   nextShowAt = now + LED_MIN_INTERVAL_MS;
 }
 
 // --- Force every VL53L4CX into a known stopped state (no power cut needed) ---
 static void forceTofColdState(){
-#if TOF_ENABLED
   for (uint8_t ch=0; ch<8; ++ch){
     if (!tcaSelect(ch)) continue;
-    // Safe to call even if not running:
     TOF[ch]->VL53L4CX_StopMeasurement();
     tcaDeselectAll();
     delay(2);
   }
-#endif
 }
 
 // ---------- Button polling (dynamic) ----------
@@ -560,7 +702,7 @@ static void pollButtons(){
   }
 }
 
-// ---------- ToF init / reinit / polling  (EXACT TEST CORE) ----------
+// ---------- ToF init / reinit / polling  ----------
 static bool initOne(uint8_t i) {
   const uint8_t ch = i;
 
@@ -571,10 +713,8 @@ static bool initOne(uint8_t i) {
       continue;
     }
 
-    delay(5); // settle like the test
-
+    delay(5);
     TOF[ch]->begin();
-    // EXACT like test: standard 8-bit address 0x52
     VL53L4CX_Error st = TOF[ch]->InitSensor(0x52);
     if (st) {
       TOF[ch]->VL53L4CX_StopMeasurement();
@@ -615,10 +755,8 @@ static uint32_t lastEnterSentMs[8] = {0};
 static void pollOne(uint8_t i) {
   if (!inited[i]) return;
 
-  unsigned long now = millis();
-  if (now - lastRender < 1) {} // no-op, keep lastRender referenced if LTO prunes
   static unsigned long lastPollMs[NUM_SENSORS] = {0};
-
+  unsigned long now = millis();
   if (now - lastPollMs[i] < POLL_INTERVAL_MS) return;
   lastPollMs[i] = now;
 
@@ -655,15 +793,9 @@ static void pollOne(uint8_t i) {
 #if ACCEPT_RS5
       bool ok = ((r == 0 || r == 5) && m >= MIN_MM && m <= MAX_MM);
 #else
-      bool ok = ((r == 0) && m >= MIN_MM && m <= MAX_MM); // EXACT test behavior
+      bool ok = ((r == 0) && m >= MIN_MM && m <= MAX_MM);
 #endif
-      if (ok) {
-        mm = m;
-        float sig = (float)data.RangeData[j].SignalRateRtnMegaCps / 65536.0f;
-        float amb = (float)data.RangeData[j].AmbientRateRtnMegaCps / 65536.0f;
-        updated = true;
-        break; // first valid object
-      }
+      if (ok) { mm = m; updated = true; break; }
     }
 
     TOF[i]->VL53L4CX_ClearInterruptAndStartMeasurement();
@@ -698,10 +830,10 @@ void setup(){
   bool warmBoot = (rr != ESP_RST_POWERON && rr != ESP_RST_DEEPSLEEP);
   if (warmBoot) {
     Serial.printf("[BOOT] Warm reset (%d) – recovering I2C\n", (int)rr);
-    i2cBusRecover();                 // clock SCL to release a stuck slave
+    i2cBusRecover();
   }
 
-  // Lamps (guard if pins overlap strips)
+  // Lamps
   pinMode(PIN_LAMP1, OUTPUT); digitalWrite(PIN_LAMP1, LOW);
   pinMode(PIN_LAMP2, OUTPUT); digitalWrite(PIN_LAMP2, LOW);
   pinMode(PIN_LAMP3, OUTPUT); digitalWrite(PIN_LAMP3, LOW);
@@ -715,7 +847,7 @@ void setup(){
   delay(150);
   tcaDeselectAll();
   if (warmBoot) {
-    forceTofColdState();             // stop all VL53s (no power cut needed)
+    forceTofColdState();
     tcaDeselectAll();
   }
 
@@ -731,10 +863,9 @@ void setup(){
   }
 
   prefs.begin("maze", false); gNodeId = prefs.getUChar("nodeId", 4); prefs.end();
-  loadTofMap();   // after prefs for nodeId if you key maps per node externally
+  loadTofMap();
   sendHello();
 
-#if TOF_ENABLED
   // init per-channel sensors
   for (uint8_t ch=0; ch<8; ch++){
     if (!initOne(ch)) {
@@ -742,28 +873,99 @@ void setup(){
       Serial.printf("[WARN] Sensor %u failed to init, will retry later.\n", ch);
     }
   }
-#endif
+
+  nodeState = NODE_IDLE;
 }
 
 // ---------- Loop ----------
 void loop(){
-#if TOF_ENABLED
-  if (!gOtaMode) {
-    for (uint8_t ch=0; ch<8; ch++) pollOne(ch);
+  // 1) Apply pending GAME_STATE first (barrier)
+  if (statePending){
+    statePending = false;
+    currentEpoch = pendingEpoch;
+    nodeState    = pendingState;
+
+    if (nodeState == NODE_PLAYING){
+      // Clear any previous overlay so baseline is visible
+      fillAllStrips(0,0,0);
+    } else {
+      // Draw local overlay for OVER or IDLE
+      fillAllStrips(pendingR, pendingG, pendingB);
+    }
   }
-#endif
-  pollButtons();
+
+  // Apply round config immediately after PLAYING flips, and only for current epoch
+  if (rcPending && nodeState == NODE_PLAYING){
+    uint8_t epoch = rcEpoch;
+    rcPending = false;       // take ownership
+
+    // If you're using epochs, only apply when it matches
+    if (currentEpoch == 0 || epoch == 0 || epoch == currentEpoch){
+      uint8_t walkBits[6]; memcpy(walkBits, (const void*)rcWalkBits, 6);
+      uint8_t targets[12];  uint8_t nT = rcNT; for (uint8_t i=0;i<nT;i++) targets[i]=rcTargets[i];
+
+      // local paint + target lamps
+      nodePaintWalkable(walkBits);
+      applyTargetsOnThisNode(nT, targets);
+    }
+  }
+
+  // 2) Sensing only while playing (buttons + ToF)
+  const bool doSense = (nodeState == NODE_PLAYING) && !gOtaMode;
+  if (doSense){
+    for (uint8_t ch=0; ch<8; ch++) pollOne(ch);
+    pollButtons();
+  }
+
+  // 3) Apply pending lamps (always honored; last-wins)
+  if (lampDirtyMask){
+    uint8_t mask = lampDirtyMask;      // take snapshot
+    lampDirtyMask = 0;                 // clear for next time
+
+    // idx 1
+    if (mask & 0x01){ digitalWrite(PIN_LAMP1, (lampDesiredMask & 0x01) ? HIGH : LOW); }
+    // idx 2
+    if (mask & 0x02){ digitalWrite(PIN_LAMP2, (lampDesiredMask & 0x02) ? HIGH : LOW); }
+    // idx 3
+    if (mask & 0x04){ digitalWrite(PIN_LAMP3, (lampDesiredMask & 0x04) ? HIGH : LOW); }
+  }
+
+  // 4) Apply one pending LED paint (PLAYING only; last-wins)
+  if (nodeState == NODE_PLAYING && ledPending){
+    // snapshot and clear
+    uint8_t  strip = ledP_strip;
+    uint16_t start = ledP_start, count = ledP_count;
+    uint8_t  r=ledP_r, g=ledP_g, b=ledP_b;
+    uint8_t  epoch = ledP_epoch;
+    ledPending = false;
+
+    if (epoch==0 || epoch==currentEpoch){
+      if (strip < stripCount && strips[strip]){
+        uint16_t end = start + count;
+        uint16_t cap = cfg[strip].count;
+        if (end > cap) end = cap;
+        for (uint16_t i=start; i<end; ++i)
+          strips[strip]->setPixelColor(i, strips[strip]->Color(r,g,b));
+        ledDirty = true;
+      }
+    }
+  }
+
+  // 5) Render LED buffers if anything changed
   render();
 
+  // 6) OTA trigger
   if (gOtaPending){
     gOtaPending=false;
     String url = (gOtaUrlBuf[0] ? String(gOtaUrlBuf) : String());
     performHttpOta(url, String(), String());
   }
 
+  // 7) HELLO/status timers
   uint32_t now = millis();
   if (gHelloPending && (int32_t)(now - helloDueAt) >= 0){ gHelloPending=false; sendHello(); }
   if (gStatusPending && (int32_t)(now - statusDueAt) >= 0){ gStatusPending=false; sendNodeStatus(); }
 
+  // 8) Keep radio TX queue moving
   pumpTx();
 }

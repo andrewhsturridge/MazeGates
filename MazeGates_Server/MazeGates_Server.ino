@@ -1,8 +1,9 @@
 /*
  * Maze Gates – Server Harness v0 (clean compile)
  * Board: ESP32 (any), Transport: ESP-NOW ch.6
- * Full-field fan-out via GATE_MAP; CLI includes help, hello, roster, claim, setgate,
- * fakegate, walkable, pushwalkable, path set, lamp, ledmap (set/show), ota, ota all, status. 
+ * CLI: help, hello, roster, claim, setgate, fakegate, walkable, pushwalkable,
+ * path set, lamp, ledmap (set/show/get), ota, ota all, status, tofvis, tofmap get/set,
+ * btnmap, btnlamp, game start/end, poc start/end.
  */
 
 #include <Arduino.h>
@@ -14,26 +15,39 @@
 #include <cstring>
 #include <stdarg.h>
 
-// ======= Protocol (same as node) =======
+#include "MazeGates_Map.h"   // shared: GATE_MAP and BTN_DEFAULT
+
+// ======= Protocol =======
 enum MsgType : uint8_t {
   HELLO=1, HELLO_REQ=2, CLAIM=3,
   GATE_EVENT=10, LED_RANGE=20, LAMP_CTRL=21,
   BUTTON_EVENT=30,
   OTA_START=50, OTA_ACK=51,
   NODE_STATUS=60,
-  LED_MAP=62,
-  LED_MAP_REQ = 63,
-  LED_MAP_RSP = 64,
-  BTN_PINS = 70,
-  BTN_PINS_REQ = 71,
-  BTN_PINS_RSP = 72,
-  TOF_MAP = 80,
-  TOF_MAP_REQ = 81,
-  TOF_MAP_RSP = 82
+  LED_MAP=62, LED_MAP_REQ=63, LED_MAP_RSP=64,
+  BTN_PINS=70, BTN_PINS_REQ=71, BTN_PINS_RSP=72,
+  TOF_MAP=80, TOF_MAP_REQ=81, TOF_MAP_RSP=82,
+  GAME_STATE=90,
+  ROUND_CFG=92
 };
+
+enum GameStateWire : uint8_t { W_IDLE=0, W_PLAYING=1, W_OVER=2 };
 
 struct __attribute__((packed)) PktHeader { uint8_t type, version, nodeId, pad; uint16_t seq, len; };
 static const uint8_t PROTO_VER = 1;
+
+struct __attribute__((packed)) GameStateMsg {
+  PktHeader h;
+  uint8_t state;    // GameStateWire
+  uint8_t r,g,b;    // overlay color for non-PLAYING state
+};
+
+struct __attribute__((packed)) RoundCfgMsg {
+  PktHeader h;            // h.pad carries epoch
+  uint8_t   nTargets;     // 0..12
+  uint8_t   targets[12];  // global Btn indices (1..12)
+  uint8_t   walkBits[6];  // 44 gates -> 44 bits (LSB = gate1)
+};
 
 struct __attribute__((packed)) HelloMsg { PktHeader h; uint8_t role; uint8_t caps; };
 struct __attribute__((packed)) ClaimMsg { PktHeader h; uint8_t newNodeId; };
@@ -42,7 +56,7 @@ struct __attribute__((packed)) ButtonEventMsg { PktHeader h; uint8_t btnIdx; uin
 struct __attribute__((packed)) LedRangeMsg { PktHeader h; uint8_t strip; uint16_t start, count; uint8_t effect; uint8_t r,g,b; uint16_t durationMs; };
 struct __attribute__((packed)) LampCtrlMsg { PktHeader h; uint8_t idx; uint8_t on; };
 struct __attribute__((packed)) OtaStartMsg { PktHeader h; char url[200]; };
-struct __attribute__((packed)) OtaAckMsg { PktHeader h; uint8_t status; /*0=starting*/ };
+struct __attribute__((packed)) OtaAckMsg { PktHeader h; uint8_t status; };
 struct __attribute__((packed)) BtnPinsMsg { PktHeader h; uint8_t n; uint8_t pin[3]; };
 struct __attribute__((packed)) BtnPinsRsp { PktHeader h; uint8_t n; uint8_t pin[3]; };
 struct __attribute__((packed)) TofMapMsg { PktHeader h; uint8_t g[8]; };
@@ -62,18 +76,19 @@ struct __attribute__((packed)) LedMapMsg {
   struct { uint8_t pin; uint16_t count; } e[5];
 };
 
-// response (matches node)
 struct __attribute__((packed)) LedMapRsp {
   PktHeader h;
   uint8_t n;
   struct { uint8_t pin; uint16_t count; } e[5];
 };
 
+// ======= Globals =======
 static uint16_t gSeq=1;
-static uint8_t kBroadcast[6]={0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+static uint8_t  kBroadcast[6]={0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+static uint8_t  gEpoch=0;   // <— declared early so helpers can use it
 
 struct NodeInfo { uint8_t nodeId; uint8_t mac[6]; };
-static std::map<uint8_t, NodeInfo> nodesById; // nodeId -> mac
+static std::map<uint8_t, NodeInfo> nodesById;
 
 struct NodeStatus {
   uint32_t uptimeMs;
@@ -84,67 +99,13 @@ struct NodeStatus {
 };
 static std::map<uint8_t, NodeStatus> lastStatus;
 
-// ======= Full-gate routing (server fan-out) =======
-struct GateMapEntry { uint8_t nodeId; uint8_t strip; uint16_t start; uint16_t count; };
+// ======= Small helpers =======
+static inline void walkSet(uint8_t* bits, uint8_t gate){
+  if (gate<1 || gate>44) return;
+  uint8_t i=(gate-1)>>3, b=(gate-1)&7; bits[i] |= (1u<<b);
+}
 
-// Index 0 unused for convenience; gates are 1..44
-static const GateMapEntry GATE_MAP[45] = {
-  /*0*/  {0,0,0,0},
-
-  /*1*/  {4,0,135,50},  /*2*/  {4,1,135,50},  /*3*/  {5,4,135,50},
-  /*4*/  {6,0,135,50},  /*5*/  {6,1,135,50},
-
-  /*6*/  {2,0, 90,50},  /*7*/  {2,0, 45,45},  /*8*/  {2,0,  0,45},
-  /*9*/  {2,1,  0,45},  /*10*/ {2,1, 45,45},  /*11*/ {2,1, 90,50},
-
-  /*12*/ {4,0, 90,45},  /*13*/ {4,1, 90,45},  /*14*/ {5,4, 90,45},
-  /*15*/ {6,0, 90,45},  /*16*/ {6,1, 90,45},
-
-  /*17*/ {2,2, 90,50},  /*18*/ {2,2, 45,45},  /*19*/ {2,2,  0,45},
-
-  /*20*/ {2,3,  0,45},  /*21*/ {2,3, 45,45},  /*22*/ {2,3, 90,50},
-
-  /*23*/ {4,0, 45,45},  /*24*/ {4,1, 45,45},  /*25*/ {5,4, 45,45},
-  /*26*/ {6,0, 45,45},  /*27*/ {6,1, 45,45},
-
-  /*28*/ {5,0, 90,50},  /*29*/ {5,0, 45,45},  /*30*/ {5,0,  0,45},
-
-  /*31*/ {5,1,  0,45},  /*32*/ {5,1, 45,45},  /*33*/ {5,1, 90,50},
-
-  /*34*/ {4,0,  0,45},  /*35*/ {4,1,  0,45},  /*36*/ {5,4,  0,45},
-
-  /*37*/ {6,0,  0,45},  /*38*/ {6,1,  0,45},
-
-  /*39*/ {5,2, 90,50},  /*40*/ {5,2, 45,45},  /*41*/ {5,2,  0,45},
-
-  /*42*/ {5,3,  0,45},  /*43*/ {5,3, 45,45},  /*44*/ {5,3, 90,50},
-};
-
-// ======= Default Button → Lamp map (no CLI needed) =======
-// Btn index = 1..12. Each maps to a (nodeId, lampIdx 1..3).
-// Assumption: local button index == lamp index on that node.
-struct BtnMapEntry { uint8_t nodeId; uint8_t lampIdx; };
-
-// Index 0 unused for convenience
-static const BtnMapEntry BTN_DEFAULT[13] = {
-  /*0*/  {0,0},
-
-  // B1..B12 (from your spec):
-  /*1*/  {4,1},  // B1  -> ESP 4, IO17 -> lampIdx 1
-  /*2*/  {4,2},  // B2  -> ESP 4, IO18 -> lampIdx 2
-  /*3*/  {1,1},  // B3  -> ESP 1, IO17 -> lampIdx 1
-  /*4*/  {1,2},  // B4  -> ESP 1, IO18 -> lampIdx 2
-  /*5*/  {1,3},  // B5  -> ESP 1, IO14 -> lampIdx 3
-  /*6*/  {2,1},  // B6  -> ESP 2, IO17 -> lampIdx 1
-  /*7*/  {2,2},  // B7  -> ESP 2, IO18 -> lampIdx 2
-  /*8*/  {3,1},  // B8  -> ESP 3, IO17 -> lampIdx 1
-  /*9*/  {3,2},  // B9  -> ESP 3, IO18 -> lampIdx 2
-  /*10*/ {3,3},  // B10 -> ESP 3, IO14 -> lampIdx 3
-  /*11*/ {6,1},  // B11 -> ESP 6, IO17 -> lampIdx 1
-  /*12*/ {6,2},  // B12 -> ESP 6, IO18 -> lampIdx 2
-};
-
-// Get default (node,lampIdx) for a global button 1..12
+// Default button map access (BTN_DEFAULT comes from shared header)
 static inline bool getDefaultBtnLamp(uint8_t btn, uint8_t &nodeId, uint8_t &lampIdx){
   if (btn < 1 || btn > 12) return false;
   nodeId = BTN_DEFAULT[btn].nodeId;
@@ -152,7 +113,6 @@ static inline bool getDefaultBtnLamp(uint8_t btn, uint8_t &nodeId, uint8_t &lamp
   return nodeId != 0;
 }
 
-// Reverse-lookup: from (nodeId, localIdx==lampIdx) to global B#
 static inline int defaultGlobalBtnFrom(uint8_t nodeId, uint8_t localIdx){
   for (uint8_t b=1; b<=12; ++b){
     if (BTN_DEFAULT[b].nodeId == nodeId && BTN_DEFAULT[b].lampIdx == localIdx) return b;
@@ -160,98 +120,9 @@ static inline int defaultGlobalBtnFrom(uint8_t nodeId, uint8_t localIdx){
   return -1;
 }
 
-// --- ToF visualization toggle ---
-static bool gTofVis = false;            // off by default
-static uint8_t gTofR = 0, gTofG = 0, gTofB = 255;  // ENTER color (blue)
-
-// ======= Game state =======
-enum GameState { WAITING=0, PLAYING=1, GAME_OVER=2 };
-
-struct Round {
-  GameState st;
-  uint8_t   targetBtn;     // 1..5 (or whatever you use)
-  uint32_t  t0;            // start millis
-  uint32_t  deadlineMs;    // 0 = no timeout
-};
-static Round G{WAITING, 0, 0, 0};
-
-// Button lamp mapping: btn 1..12 -> (node,lampIdx)
-struct BtnLamp { uint8_t nodeId; uint8_t lampIdx; bool valid; };
-static BtnLamp BTNMAP[13] = {}; // index 1..12 used
-
-// Debug: optional press->pulse for mapped lamps
-static bool gBtnEcho = false;
-static uint32_t lampPulseUntil[13] = {}; // per B#, 0 = inactive
-static const uint16_t BTN_PULSE_MS = 200;
-
-static void setAllLamps(bool on){
-  for (uint8_t btn=1; btn<=12; ++btn){
-    uint8_t nid, lidx;
-    if (getDefaultBtnLamp(btn, nid, lidx)) sendLampCtrl(nid, lidx, on);
-  }
-}
-static void setTargetLamp(uint8_t btn, bool on){
-  uint8_t nid, lidx;
-  if (getDefaultBtnLamp(btn, nid, lidx)) sendLampCtrl(nid, lidx, on);
-}
-
-// Quick helper: paint every (node,strip) to a color once (using GATE_MAP extents)
-static void paintAll(uint8_t r, uint8_t g, uint8_t b){
-  uint16_t maxLen[8][8] = {}; bool seenStrip[8][8] = {}; bool seenNode[8] = {};
-  for (uint8_t gg=1; gg<=44; ++gg){
-    const auto &e = GATE_MAP[gg]; if (!e.nodeId) continue;
-    uint16_t end = e.start + e.count;
-    if (end > maxLen[e.nodeId][e.strip]) maxLen[e.nodeId][e.strip] = end;
-    seenStrip[e.nodeId][e.strip] = true; seenNode[e.nodeId] = true;
-  }
-  for (uint8_t n=0;n<8;++n){
-    if (!seenNode[n]) continue;
-    for (uint8_t s=0;s<8;++s){
-      if (!seenStrip[n][s]) continue;
-      uint16_t cnt = maxLen[n][s]; if (!cnt) continue;
-      sendLedRange(n, s, 0, cnt, r,g,b);
-    }
-  }
-}
-
-// Start / end round
-static void gameStart(uint32_t seconds, uint8_t btn){
-  G.st = PLAYING;
-  G.targetBtn = btn;
-  G.t0 = millis();
-  G.deadlineMs = seconds ? (seconds * 1000UL) : 0;
-
-  // Lamps: only target ON
-  setAllLamps(false);
-  setTargetLamp(btn, true);
-
-  // Baseline render: whatever is in 'walkable' right now
-  pushWalkable();
-
-  Serial.printf("[GAME] START %lus target=Btn%u\n", (unsigned)seconds, btn);
-}
-
-static void gameEnd(bool win){
-  // Lamps off
-  setAllLamps(false);
-
-  // Simple win/lose overlay
-  if (win) {
-    paintAll(0,150,0);    // full green overlay once
-  } else {
-    paintAll(150,0,0);    // full red overlay once
-  }
-
-  G.st = GAME_OVER;
-  G.deadlineMs = 0;
-  Serial.printf("[GAME] END (%s)\n", win ? "WIN" : "TIMEOUT/END");
-}
-
-// ======= Utilities =======
-
-#define LOG_Q_SIZE 32     // number of lines to buffer (power of two not required)
-#define LOG_LINE_MAX 160  // max chars per line (enough for our maps)
-
+// ======= Logging =======
+#define LOG_Q_SIZE 32
+#define LOG_LINE_MAX 160
 static char logQ[LOG_Q_SIZE][LOG_LINE_MAX];
 static volatile uint8_t logHead = 0, logTail = 0;
 
@@ -260,22 +131,20 @@ static void qlogf(const char* fmt, ...) {
   va_list ap; va_start(ap, fmt);
   vsnprintf(buf, sizeof(buf), fmt, ap);
   va_end(ap);
-
   uint8_t next = (uint8_t)((logTail + 1) % LOG_Q_SIZE);
-  if (next == logHead) {              // queue full -> drop oldest
-    logHead = (uint8_t)((logHead + 1) % LOG_Q_SIZE);
-  }
+  if (next == logHead) logHead = (uint8_t)((logHead + 1) % LOG_Q_SIZE);
   strncpy(logQ[logTail], buf, LOG_LINE_MAX-1);
   logQ[logTail][LOG_LINE_MAX-1] = '\0';
   logTail = next;
 }
-
 static void flushLogs() {
   while (logHead != logTail) {
     Serial.println(logQ[logHead]);
     logHead = (uint8_t)((logHead + 1) % LOG_Q_SIZE);
   }
 }
+
+// ======= Net utils =======
 static String macToStr(const uint8_t m[6]){
   char b[18]; sprintf(b,"%02X:%02X:%02X:%02X:%02X:%02X",m[0],m[1],m[2],m[3],m[4],m[5]); return String(b);
 }
@@ -287,7 +156,7 @@ static void sendRaw(const uint8_t mac[6], const uint8_t* data, size_t len){ esp_
 static void bcastHelloReq(){ HelloMsg m{}; m.h={HELLO_REQ,PROTO_VER,0,0,gSeq++,sizeof(HelloMsg)}; m.role=0; m.caps=0; sendRaw(kBroadcast,(uint8_t*)&m,sizeof(m)); }
 static void sendClaim(const uint8_t mac[6], uint8_t nodeId){ ClaimMsg m{}; m.h={CLAIM,PROTO_VER,0,0,gSeq++,sizeof(ClaimMsg)}; m.newNodeId=nodeId; sendRaw(mac,(uint8_t*)&m,sizeof(m)); }
 
-// ======= Drip TX queue for ESP-NOW =======
+// ======= Drip TX queue =======
 struct TxItem { uint8_t mac[6]; uint8_t len; uint8_t buf[64]; };
 static TxItem txQ[64];
 static volatile uint8_t qHead = 0, qTail = 0;
@@ -309,34 +178,65 @@ static void dripPump(){
   lastTxMs = millis();
   qHead = (uint8_t)((qHead + 1) & 63);
 }
+static inline void txQClear(){ qHead = qTail; }
+static void flushTxQueueQuickly(uint16_t ms=120){
+  uint32_t t0 = millis();
+  while (qHead != qTail && (millis() - t0) < ms){
+    dripPump();
+    delay(2);
+  }
+}
 
-// ======= Send helpers (queued where appropriate) =======
+// ======= Send helpers (explicit header writes) =======
+static void sendGameStateBroadcast(uint8_t state, uint8_t r, uint8_t g, uint8_t b){
+  GameStateMsg m{};
+  m.h.type = GAME_STATE;  m.h.version = PROTO_VER; m.h.nodeId = 0; m.h.pad = gEpoch;
+  m.h.seq  = gSeq++;      m.h.len     = sizeof(GameStateMsg);
+  m.state  = state;       m.r=r; m.g=g; m.b=b;
+  sendRaw(kBroadcast, (uint8_t*)&m, sizeof(m));
+}
 static void sendLedRange(uint8_t nodeId, uint8_t strip, uint16_t start, uint16_t count,
                          uint8_t r,uint8_t g,uint8_t b){
   auto it = nodesById.find(nodeId); if (it == nodesById.end()) return;
-  LedRangeMsg m{}; m.h = {LED_RANGE, PROTO_VER, 0, 0, gSeq++, (uint16_t)sizeof(LedRangeMsg)};
-  m.strip = strip; m.start = start; m.count = count; m.effect = 0; m.r = r; m.g = g; m.b = b; m.durationMs = 0;
+  LedRangeMsg m{};
+  m.h.type=LED_RANGE; m.h.version=PROTO_VER; m.h.nodeId=0; m.h.pad=gEpoch;
+  m.h.seq=gSeq++;     m.h.len=sizeof(LedRangeMsg);
+  m.strip=strip; m.start=start; m.count=count; m.effect=0; m.r=r; m.g=g; m.b=b; m.durationMs=0;
   _enqueueTx(it->second.mac, &m, sizeof(m));
 }
 static void sendLampCtrl(uint8_t nodeId, uint8_t idx, bool on){
   auto it=nodesById.find(nodeId); if (it==nodesById.end()) return;
-  LampCtrlMsg m{}; m.h={LAMP_CTRL,PROTO_VER,0,0,gSeq++,sizeof(LampCtrlMsg)}; m.idx=idx; m.on=on?1:0;
+  LampCtrlMsg m{};
+  m.h.type=LAMP_CTRL; m.h.version=PROTO_VER; m.h.nodeId=0; m.h.pad=gEpoch;
+  m.h.seq=gSeq++;     m.h.len=sizeof(LampCtrlMsg);
+  m.idx=idx; m.on=on?1:0;
   sendRaw(it->second.mac,(uint8_t*)&m,sizeof(m));
 }
 static void sendOtaStart(uint8_t nodeId, const String& url){
   auto it=nodesById.find(nodeId); if (it==nodesById.end()) return;
-  OtaStartMsg m{}; m.h={OTA_START,PROTO_VER,0,0,gSeq++,sizeof(OtaStartMsg)};
+  OtaStartMsg m{};
+  m.h.type=OTA_START; m.h.version=PROTO_VER; m.h.nodeId=0; m.h.pad=0;
+  m.h.seq=gSeq++;     m.h.len=sizeof(OtaStartMsg);
   memset(m.url, 0, sizeof(m.url));
   if (url.length()>0) strncpy(m.url, url.c_str(), sizeof(m.url)-1);
   sendRaw(it->second.mac,(uint8_t*)&m,sizeof(m));
 }
 
+// ======= ROUND_CFG sender =======
+static void sendRoundCfg(const uint8_t* targets, uint8_t nTargets, const uint8_t* walkBits){
+  if (nTargets>12) nTargets=12;
+  RoundCfgMsg m{};
+  m.h.type=ROUND_CFG; m.h.version=PROTO_VER; m.h.nodeId=0; m.h.pad=gEpoch;
+  m.h.seq=gSeq++;     m.h.len=sizeof(RoundCfgMsg);
+  m.nTargets = nTargets;
+  for (uint8_t i=0;i<nTargets;i++) m.targets[i]=targets[i];
+  memset(m.walkBits, 0, sizeof(m.walkBits));
+  if (walkBits) memcpy(m.walkBits, walkBits, 6);
+  sendRaw(kBroadcast, (uint8_t*)&m, sizeof(m));
+}
+
 // ======= Routing helpers =======
-static bool routeGate(uint8_t gateId,
-                      /*out*/uint8_t &nodeId,
-                      /*out*/uint8_t &strip,
-                      /*out*/uint16_t &start,
-                      /*out*/uint16_t &count) {
+static bool routeGate(uint8_t gateId, uint8_t &nodeId, uint8_t &strip, uint16_t &start, uint16_t &count) {
   if (gateId < 1 || gateId > 44) return false;
   const GateMapEntry &e = GATE_MAP[gateId];
   if (e.nodeId == 0) return false;
@@ -344,23 +244,21 @@ static bool routeGate(uint8_t gateId,
   return true;
 }
 
-// ======= Walkable / game fan-out =======
+// ======= Walkable fan-out (kept for CLI / debug) =======
 #define GATE_MAX 44
-static bool walkable[GATE_MAX+1]; // 1..44 used
+static bool walkable[GATE_MAX+1]; // 1..44
 static inline void clearWalkable(){ memset(walkable, 0, sizeof(walkable)); }
 static inline bool isWalkable(uint8_t g){ return (g>=1 && g<=GATE_MAX) ? walkable[g] : false; }
 
 static void pushWalkable(){
-  // 1) Compute base coat extents per (node,strip)
+  // Base coat per (node,strip)
   uint16_t maxLen[8][8] = {}; bool seenStrip[8][8] = {}; bool seenNode[8] = {};
   for (uint8_t g=1; g<=44; ++g){
-    const GateMapEntry &e = GATE_MAP[g];
-    if (!e.nodeId) continue;
+    const GateMapEntry &e = GATE_MAP[g]; if (!e.nodeId) continue;
     uint16_t end = e.start + e.count;
     if (end > maxLen[e.nodeId][e.strip]) maxLen[e.nodeId][e.strip] = end;
     seenStrip[e.nodeId][e.strip] = true; seenNode[e.nodeId] = true;
   }
-  // 2) Base coat red
   for (uint8_t n=0;n<8;++n){
     if (!seenNode[n]) continue;
     for (uint8_t s=0;s<8;++s){
@@ -369,7 +267,7 @@ static void pushWalkable(){
       sendLedRange(n, s, 0, cnt, 150,0,0);
     }
   }
-  // 3) Overlay greens where walkable
+  // Greens
   for (uint8_t g=1; g<=44; ++g){
     const GateMapEntry &e = GATE_MAP[g]; if (!e.nodeId) continue;
     const bool ok = walkable[g];
@@ -377,19 +275,79 @@ static void pushWalkable(){
   }
 }
 
-static void processGateEvent(uint8_t gateId, uint8_t ev){
-  uint8_t nodeId, strip; uint16_t start, count;
-  if (!routeGate(gateId, nodeId, strip, start, count)) return;
+static void setWalkableFromBits(const uint8_t wb[6]){
+  memset(walkable, 0, sizeof(walkable));
+  for (uint8_t g=1; g<=44; ++g){
+    uint8_t i = (uint8_t)((g-1) >> 3);
+    uint8_t b = (uint8_t)((g-1) & 7);
+    if ((wb[i] >> b) & 1u) walkable[g] = true;
+  }
+}
 
-  // If visualization is ON and this is ENTER, paint special color
-  if (gTofVis && ev == 1 /*ENTER*/){
-    sendLedRange(nodeId, strip, start, count, gTofR, gTofG, gTofB);
+// ======= Gate events =======
+static bool gTofVis=false; static uint8_t gTofR=0, gTofG=0, gTofB=255;
+
+enum GameState { WAITING=0, PLAYING=1, GAME_OVER=2 };
+struct Round { GameState st; uint8_t targetBtn; uint32_t t0; uint32_t deadlineMs; };
+static Round G{WAITING, 0, 0, 0};
+
+static void processGateEvent(uint8_t gateId, uint8_t ev){
+  if (G.st != PLAYING){
+    if (gTofVis && ev == 1){
+      uint8_t nodeId, strip; uint16_t start, count;
+      if (routeGate(gateId, nodeId, strip, start, count))
+        sendLedRange(nodeId, strip, start, count, gTofR, gTofG, gTofB);
+    }
     return;
   }
-
-  // Otherwise repaint baseline (walkable=green, not=red)
+  if (ev == 1 && !isWalkable(gateId)){ gameEnd(false); return; }
+  uint8_t nodeId, strip; uint16_t start, count;
+  if (!routeGate(gateId, nodeId, strip, start, count)) return;
   const bool ok = isWalkable(gateId);
   sendLedRange(nodeId, strip, start, count, ok?0:150, ok?150:0, 0);
+}
+
+// ======= Lamps =======
+struct BtnLamp { uint8_t nodeId; uint8_t lampIdx; bool valid; };
+static BtnLamp BTNMAP[13] = {};
+
+static bool gBtnEcho=false;
+static uint32_t lampPulseUntil[13]={0};
+static const uint16_t BTN_PULSE_MS=200;
+
+static void setAllLamps(bool on){
+  for (uint8_t btn=1; btn<=12; ++btn){
+    uint8_t nid,lidx; if (getDefaultBtnLamp(btn, nid, lidx)) sendLampCtrl(nid, lidx, on);
+  }
+}
+static void setTargetLamp(uint8_t btn, bool on){
+  uint8_t nid,lidx; if (getDefaultBtnLamp(btn, nid, lidx)) sendLampCtrl(nid, lidx, on);
+}
+
+// ======= Start / End =======
+static void gameStart(uint32_t seconds, uint8_t btn){
+  gEpoch++;
+  G.st=PLAYING; G.targetBtn=btn; G.t0=millis(); G.deadlineMs = seconds ? (seconds*1000UL) : 0;
+  sendGameStateBroadcast(W_PLAYING, 0,0,0);  // flip nodes
+  delay(10);                                 // small settle so nodes apply PLAYING first
+  setAllLamps(false);
+  setTargetLamp(btn, true);
+  // If using RoundCfg path, you'll send it in CLI (poc start). For classic mode:
+  // pushWalkable();
+  Serial.printf("[GAME] START %lus target=Btn%u epoch=%u\n", (unsigned)seconds, btn, gEpoch);
+}
+static void gameEnd(bool win){
+  G.st = GAME_OVER;
+  G.deadlineMs = 0;
+
+  // Lamps off
+  setAllLamps(false);
+
+  // Tell nodes to freeze and paint local overlay
+  if (win) sendGameStateBroadcast(W_OVER, 0,150,0);   // GREEN
+  else     sendGameStateBroadcast(W_OVER, 150,0,0);   // RED
+
+  Serial.printf("[GAME] END (%s) epoch=%u\n", win ? "WIN" : "TIMEOUT/END", gEpoch);
 }
 
 // ======= RX =======
@@ -403,6 +361,7 @@ static void logNodeStatus(uint8_t nodeId, const NodeStatusMsg* m) {
   Serial.print("] ");
   Serial.printf("maxErr=%u\n", m->errStreakMax);
 }
+
 static void printNodeLedMap(uint8_t nodeId, const LedMapRsp* r){
   Serial.printf("LEDMAP node %u: ", nodeId);
   for (uint8_t i=0; i<r->n && i<5; ++i){
@@ -416,10 +375,8 @@ static void printNodeLedMap(uint8_t nodeId, const LedMapRsp* r){
 static void sendLedMapReq(uint8_t nodeId){
   auto it = nodesById.find(nodeId); if (it==nodesById.end()) return;
   PktHeader h{ LED_MAP_REQ, PROTO_VER, 0, 0, gSeq++, (uint16_t)sizeof(PktHeader) };
-  // small message; send directly is fine (or _enqueueTx if you prefer)
   sendRaw(it->second.mac, (uint8_t*)&h, sizeof(h));
 }
-
 static void sendBtnPinsReq(uint8_t nodeId){
   auto it = nodesById.find(nodeId); if (it==nodesById.end()) { Serial.println("Unknown nodeId"); return; }
   PktHeader h{ BTN_PINS_REQ, PROTO_VER, 0,0, gSeq++, (uint16_t)sizeof(PktHeader) };
@@ -427,7 +384,7 @@ static void sendBtnPinsReq(uint8_t nodeId){
 }
 static void sendBtnPinsSet(uint8_t nodeId, const uint8_t *pins, uint8_t n){
   auto it = nodesById.find(nodeId); if (it==nodesById.end()) { Serial.println("Unknown nodeId"); return; }
-  BtnPinsMsg m{}; m.h={ BTN_PINS, PROTO_VER, 0,0, gSeq++, (uint16_t)sizeof(BtnPinsMsg) };
+  BtnPinsMsg m{}; m.h.type=BTN_PINS; m.h.version=PROTO_VER; m.h.nodeId=0; m.h.pad=0; m.h.seq=gSeq++; m.h.len=sizeof(BtnPinsMsg);
   m.n=n; for (uint8_t i=0;i<n;i++) m.pin[i]=pins[i];
   _enqueueTx(it->second.mac,&m,sizeof(m));
 }
@@ -437,7 +394,6 @@ static void printBtnPins(uint8_t nodeId, const BtnPinsRsp* r){
   for (uint8_t i=0;i<r->n;i++){ if (i) Serial.print(", "); Serial.printf("%u", r->pin[i]); }
   Serial.println();
 }
-
 static void sendTofMapReq(uint8_t nodeId){
   auto it = nodesById.find(nodeId); if (it==nodesById.end()){ Serial.println("Unknown nodeId"); return; }
   PktHeader h{ TOF_MAP_REQ, PROTO_VER, 0,0, gSeq++, (uint16_t)sizeof(PktHeader) };
@@ -445,7 +401,7 @@ static void sendTofMapReq(uint8_t nodeId){
 }
 static void sendTofMapSet(uint8_t nodeId, const uint8_t g[8]){
   auto it = nodesById.find(nodeId); if (it==nodesById.end()){ Serial.println("Unknown nodeId"); return; }
-  TofMapMsg m{}; m.h = { TOF_MAP, PROTO_VER, 0,0, gSeq++, (uint16_t)sizeof(TofMapMsg) };
+  TofMapMsg m{}; m.h.type=TOF_MAP; m.h.version=PROTO_VER; m.h.nodeId=0; m.h.pad=0; m.h.seq=gSeq++; m.h.len=sizeof(TofMapMsg);
   memcpy(m.g, g, 8);
   _enqueueTx(it->second.mac, &m, sizeof(m));
 }
@@ -479,32 +435,23 @@ static void onNowRecv(const esp_now_recv_info* info, const uint8_t* data, int le
     Serial.printf("BUTTON%u %s from node %u\n",
                   m->btnIdx, (m->ev==1?"PRESS":"RELEASE"), h->nodeId);
 
-    // Resolve to global button using defaults (no dynamic mapping)
     const int globalB = defaultGlobalBtnFrom(h->nodeId, m->btnIdx);
     if (globalB > 0) Serial.printf("  => B%d (default)\n", globalB);
 
-    // Echo pulse on PRESS using defaults (if enabled)
-    if (gBtnEcho && m->ev == 1 /*PRESS*/){
+    if (gBtnEcho && m->ev == 1){
       if (globalB >= 1 && globalB <= 12){
-        uint8_t nid,lidx;
-        if (getDefaultBtnLamp((uint8_t)globalB, nid, lidx)){
+        uint8_t nid,lidx; if (getDefaultBtnLamp((uint8_t)globalB, nid, lidx)){
           sendLampCtrl(nid, lidx, true);
           lampPulseUntil[globalB] = millis() + BTN_PULSE_MS;
         }
       }
     }
 
-    // Gameplay reacts only to PRESS during PLAYING
-    if (G.st == PLAYING && m->ev == 1 /*PRESS*/){
-      if (globalB > 0 && globalB == G.targetBtn) {
-        gameEnd(true);
-      } else {
-        paintAll(150,0,0);  // penalty overlay (one-shot)
-        Serial.println("[GAME] Wrong button (penalty)");
-      }
+    if (G.st == PLAYING && m->ev == 1){
+      if (globalB > 0 && globalB == G.targetBtn) gameEnd(true);
+      else { gameEnd(false); Serial.println("[GAME] Wrong button (penalty)"); }
     }
   }
-
   else if (h->type == NODE_STATUS && len >= (int)sizeof(NodeStatusMsg)) {
     const NodeStatusMsg* m = (const NodeStatusMsg*)data;
     lastStatus[h->nodeId] = { m->uptimeMs, m->initedMask, m->errStreakMax, {0}, millis() };
@@ -516,9 +463,8 @@ static void onNowRecv(const esp_now_recv_info* info, const uint8_t* data, int le
     if (r->n == 0) { qlogf("LEDMAP node %u: (none)", h->nodeId); }
     else {
       char line[LOG_LINE_MAX]; int pos = snprintf(line, sizeof(line), "LEDMAP node %u: ", h->nodeId);
-      for (uint8_t i=0; i<r->n && i<5; ++i) {
+      for (uint8_t i=0; i<r->n && i<5; ++i)
         pos += snprintf(line+pos, sizeof(line)-pos, "%s%u:%u", (i? ", " : ""), r->e[i].pin, r->e[i].count);
-      }
       qlogf("%s", line);
     }
   }
@@ -534,7 +480,6 @@ static void onNowRecv(const esp_now_recv_info* info, const uint8_t* data, int le
     qlogf("TOFMAP node %u: %u,%u,%u,%u,%u,%u,%u,%u",
           h->nodeId, r->g[0],r->g[1],r->g[2],r->g[3],r->g[4],r->g[5],r->g[6],r->g[7]);
   }
-
 }
 
 // ======= Setup / CLI / Loop =======
@@ -562,8 +507,9 @@ static void printHelp(){
   Serial.println("  status");
   Serial.println("  tofvis on|off  (optional: tofvis on <r> <g> <b>)");
   Serial.println("  tofmap get <nodeId> | tofmap get all");
-  Serial.println("  tofmap set <nodeId> g0,g1,g2,g3,g4,g5,g6,g7   (0=unused)");
-
+  Serial.println("  tofmap set <nodeId> g0,g1,g2,g3,g4,g5,g6,g7");
+  Serial.println("  poc start <seconds>   (B4 target; walkable: 39,28,17,6)");
+  Serial.println("  poc end");
 }
 
 static void printLedMap(int filterNodeId){
@@ -583,7 +529,6 @@ void setup(){
   esp_now_init();
   esp_now_register_recv_cb(onNowRecv);
 
-  // broadcast peer for HELLO_REQ
   esp_now_peer_info_t p{}; memcpy(p.peer_addr,kBroadcast,6);
   p.channel=6; p.encrypt=false; p.ifidx = WIFI_IF_STA; esp_now_add_peer(&p);
 
@@ -662,7 +607,7 @@ static void handleCli(String s){
     return;
   }
 
-  // path set <ids>  -> clear -> add -> push
+  // path set <ids> -> clear -> add -> push
   if (s.startsWith("path set ")){
     char buf[256]; s.toCharArray(buf, sizeof(buf));
     char *p = strstr(buf, "set ");
@@ -687,19 +632,14 @@ static void handleCli(String s){
     return;
   }
 
-  // ledmap show [nodeId]    -> print server's GATE_MAP (routing view)
-  // ledmap get <nodeId>|all -> query node(s) for stored pin:count (runtime view)
-  // ledmap <nodeId> <pin:count>[,<pin:count>...] -> set and reboot node
+  // ledmap …
   if (s.startsWith("ledmap")){
-    // normalize whitespace
     s.replace("\r",""); s.replace("\n",""); s.trim();
 
-    // SHOW
     if (s == "ledmap show"){ printLedMap(-1); return; }
     int filtId = -1;
     if (sscanf(s.c_str(),"ledmap show %d", &filtId)==1){ printLedMap(filtId); return; }
 
-    // GET
     if (s == "ledmap get all"){
       for (auto &kv : nodesById) sendLedMapReq(kv.first);
       Serial.println("LEDMAP GET sent to all nodes");
@@ -712,16 +652,14 @@ static void handleCli(String s){
       return;
     }
 
-    // SET
     int nid = -1; char list[256]={0};
     if (sscanf(s.c_str(),"ledmap %d %255s", &nid, list)==2 && nid>=0){
       auto it = nodesById.find((uint8_t)nid);
       if (it == nodesById.end()) { Serial.println("Unknown nodeId"); return; }
 
-      LedMapMsg m{}; m.h={ LED_MAP, PROTO_VER, 0,0, gSeq++, (uint16_t)sizeof(LedMapMsg) };
+      LedMapMsg m{}; m.h.type=LED_MAP; m.h.version=PROTO_VER; m.h.nodeId=0; m.h.pad=0; m.h.seq=gSeq++; m.h.len=sizeof(LedMapMsg);
       m.n = 0;
 
-      // parse <pin:count>[,<pin:count>...]
       char buf[256]; strncpy(buf, list, sizeof(buf)-1); buf[sizeof(buf)-1]=0;
       char *tok = strtok(buf, ",");
       while (tok && m.n < 5){
@@ -735,17 +673,16 @@ static void handleCli(String s){
       }
       if (m.n==0){ Serial.println("usage: ledmap <nodeId> <pin:count>[,<pin:count>...]"); return; }
 
-      _enqueueTx(it->second.mac, &m, sizeof(m));   // use drip queue
+      _enqueueTx(it->second.mac, &m, sizeof(m));
       Serial.printf("LED_MAP sent to node=%d with %u strips\n", nid, m.n);
       return;
     }
 
-    // Fallback usage
     Serial.println("usage: ledmap show [nodeId] | ledmap get <nodeId>|all | ledmap <nodeId> <pin:count>[,<pin:count>...]");
     return;
   }
 
-  // tofmap get <nodeId>|all
+  // tofmap get
   if (s.startsWith("tofmap get")){
     int nid=-1;
     if (s=="tofmap get all"){ for (auto &kv : nodesById) sendTofMapReq(kv.first); Serial.println("TOFMAP GET sent to all"); return; }
@@ -754,7 +691,7 @@ static void handleCli(String s){
     return;
   }
 
-  // tofmap set <nodeId> g0,g1,g2,g3,g4,g5,g6,g7   (0 for unused)
+  // tofmap set
   if (s.startsWith("tofmap set ")){
     int nid=-1; char list[128]={0};
     if (sscanf(s.c_str(),"tofmap set %d %127s",&nid,list)==2){
@@ -769,7 +706,7 @@ static void handleCli(String s){
     return;
   }
 
-  // ota <nodeId> [url]
+  // ota
   if (s.startsWith("ota ")){
     if (s.startsWith("ota all")){
       char url[256]={0}; int n=sscanf(s.c_str(),"ota all %255s", url);
@@ -787,7 +724,7 @@ static void handleCli(String s){
   }
 
   if (s=="status"){
-    bcastHelloReq(); // on-demand status (nodes may piggyback)
+    bcastHelloReq();
     Serial.println("node  uptime(s)  inited  maxErr  reinitCounts");
     for (auto &kv : lastStatus) {
       auto nid = kv.first; const auto &st = kv.second;
@@ -798,8 +735,8 @@ static void handleCli(String s){
     return;
   }
 
+  // btnmap (dynamic override tools)
   if (s.startsWith("btnmap")){
-    // normalize
     s.replace("\r",""); s.replace("\n",""); s.trim();
 
     if (s=="btnmap show"){
@@ -830,7 +767,7 @@ static void handleCli(String s){
     return;
   }
 
-  // btnlamp echo on|off   -> pulse mapped lamp on PRESS via defaults
+  // btnlamp echo on|off
   if (s.startsWith("btnlamp echo ")){
     char onoff[8]={0};
     if (sscanf(s.c_str(),"btnlamp echo %7s", onoff)==1){
@@ -840,7 +777,7 @@ static void handleCli(String s){
     return;
   }
 
-  // btnlamp <btn> <on|off>   -> manual control via default map
+  // btnlamp <btn> <on|off>
   if (s.startsWith("btnlamp ")){
     int btn=0; char onoff[8]={0};
     if (sscanf(s.c_str(),"btnlamp %d %7s",&btn,onoff)==2 && btn>=1 && btn<=12){
@@ -854,7 +791,7 @@ static void handleCli(String s){
     return;
   }
 
-  // btnlamptest [ms]   -> cycle through default-mapped lamps
+  // btnlamptest [ms]
   if (s.startsWith("btnlamptest")){
     int ms=200; sscanf(s.c_str(),"btnlamptest %d",&ms);
     if (ms<50) ms=50; if (ms>2000) ms=2000;
@@ -878,7 +815,7 @@ static void handleCli(String s){
     return;
   }
 
-  // btnpins set <nodeId> <pin[,pin[,pin]]>
+  // btnpins set/get
   if (s.startsWith("btnpins set ")){
     int nid; char list[64]={0};
     if (sscanf(s.c_str(),"btnpins set %d %63s",&nid,list)==2){
@@ -892,15 +829,13 @@ static void handleCli(String s){
     } else Serial.println("usage: btnpins set <nodeId> <pin[,pin[,pin]]>");
     return;
   }
-
-  // btnpins get <nodeId>
   if (s.startsWith("btnpins get ")){
     int nid; if (sscanf(s.c_str(),"btnpins get %d",&nid)==1){ sendBtnPinsReq((uint8_t)nid); }
     else Serial.println("usage: btnpins get <nodeId>");
     return;
   }
 
-  // tofvis on|off [r g b]
+  // tofvis
   if (s.startsWith("tofvis")){
     int r=0,g=0,b=255;
     if (s=="tofvis on"){ gTofVis=true; Serial.println("ToF visualization: ON (blue)"); return; }
@@ -920,6 +855,37 @@ static void handleCli(String s){
   // game end
   if (s=="game end"){ gameEnd(false); return; }
 
+  // ---- POC: start/end using RoundCfg (nodes paint locally) ----
+  if (s.startsWith("poc start")){
+    int secs = 20; sscanf(s.c_str(), "poc start %d", &secs);
+
+    gEpoch++;                 // new epoch
+    G.st = PLAYING; G.targetBtn = 4; G.t0 = millis();
+    G.deadlineMs = secs > 0 ? (uint32_t)secs * 1000UL : 0;
+
+    sendGameStateBroadcast(W_PLAYING, 0,0,0);
+    delay(10);
+
+    // Walkable bitset: 39, 28, 17, 6
+    uint8_t walkBits[6] = {0,0,0,0,0,0};
+    walkSet(walkBits, 39); walkSet(walkBits, 28); walkSet(walkBits, 17); walkSet(walkBits, 6);
+
+    setWalkableFromBits(walkBits);
+
+    const uint8_t targets[1] = { 4 };   // B4
+
+    sendRoundCfg(targets, 1, walkBits);
+
+    Serial.printf("[POC] START epoch=%u sec=%d target=B4 path=39,28,17,6\n", gEpoch, secs);
+    return;
+  }
+
+  if (s == "poc end"){
+    gameEnd(false);
+    Serial.println("[POC] END");
+    return;
+  }
+
   if (s=="") return;
   Serial.println("Unknown command. Type: help");
 }
@@ -938,7 +904,6 @@ void loop(){
     }
   }
 
-  // Timeout?
   if (G.st == PLAYING && G.deadlineMs > 0 && (millis() - G.t0) > G.deadlineMs){
     gameEnd(false);
   }
