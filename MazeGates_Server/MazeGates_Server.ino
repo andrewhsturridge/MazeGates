@@ -188,6 +188,20 @@ static void flushTxQueueQuickly(uint16_t ms=120){
 }
 
 // ======= Send helpers (explicit header writes) =======
+static void sendGameStateToAll(uint8_t state, uint8_t r, uint8_t g, uint8_t b, int repeats=3, int gap_ms=4){
+  GameStateMsg m{};
+  m.h.type = GAME_STATE;  m.h.version = PROTO_VER; m.h.nodeId = 0; m.h.pad = gEpoch;
+  m.h.seq  = gSeq++;      m.h.len     = sizeof(GameStateMsg);
+  m.state  = state;       m.r=r; m.g=g; m.b=b;
+
+  for (int rep=0; rep<repeats; ++rep){
+    // 1) broadcast
+    sendRaw(kBroadcast, (uint8_t*)&m, sizeof(m));
+    // 2) unicast to each known node
+    for (auto &kv : nodesById) sendRaw(kv.second.mac, (uint8_t*)&m, sizeof(m));
+    delay(gap_ms);
+  }
+}
 static void sendGameStateBroadcast(uint8_t state, uint8_t r, uint8_t g, uint8_t b){
   GameStateMsg m{};
   m.h.type = GAME_STATE;  m.h.version = PROTO_VER; m.h.nodeId = 0; m.h.pad = gEpoch;
@@ -291,6 +305,16 @@ enum GameState { WAITING=0, PLAYING=1, GAME_OVER=2 };
 struct Round { GameState st; uint8_t targetBtn; uint32_t t0; uint32_t deadlineMs; };
 static Round G{WAITING, 0, 0, 0};
 
+// Defer GAME_OVER out of onNowRecv
+static volatile bool gEndPending = false;
+static volatile bool gEndWin     = false;
+
+static inline void scheduleGameEnd(bool win){
+  if (G.st == PLAYING) G.st = GAME_OVER;  // freeze server logic immediately
+  gEndWin     = win;
+  gEndPending = true;
+}
+
 static void processGateEvent(uint8_t gateId, uint8_t ev){
   if (G.st != PLAYING){
     if (gTofVis && ev == 1){
@@ -300,7 +324,7 @@ static void processGateEvent(uint8_t gateId, uint8_t ev){
     }
     return;
   }
-  if (ev == 1 && !isWalkable(gateId)){ gameEnd(false); return; }
+  if (ev == 1 && !isWalkable(gateId)){ scheduleGameEnd(false); return; }
   uint8_t nodeId, strip; uint16_t start, count;
   if (!routeGate(gateId, nodeId, strip, start, count)) return;
   const bool ok = isWalkable(gateId);
@@ -328,7 +352,7 @@ static void setTargetLamp(uint8_t btn, bool on){
 static void gameStart(uint32_t seconds, uint8_t btn){
   gEpoch++;
   G.st=PLAYING; G.targetBtn=btn; G.t0=millis(); G.deadlineMs = seconds ? (seconds*1000UL) : 0;
-  sendGameStateBroadcast(W_PLAYING, 0,0,0);  // flip nodes
+  sendGameStateToAll(W_PLAYING, 0,0,0);
   delay(10);                                 // small settle so nodes apply PLAYING first
   setAllLamps(false);
   setTargetLamp(btn, true);
@@ -344,8 +368,9 @@ static void gameEnd(bool win){
   setAllLamps(false);
 
   // Tell nodes to freeze and paint local overlay
-  if (win) sendGameStateBroadcast(W_OVER, 0,150,0);   // GREEN
-  else     sendGameStateBroadcast(W_OVER, 150,0,0);   // RED
+  uint8_t R = win ? 0   : 150;
+  uint8_t Gc= win ? 150 : 0;
+  sendGameStateToAll(W_OVER, R, Gc, 0);
 
   Serial.printf("[GAME] END (%s) epoch=%u\n", win ? "WIN" : "TIMEOUT/END", gEpoch);
 }
@@ -448,8 +473,8 @@ static void onNowRecv(const esp_now_recv_info* info, const uint8_t* data, int le
     }
 
     if (G.st == PLAYING && m->ev == 1){
-      if (globalB > 0 && globalB == G.targetBtn) gameEnd(true);
-      else { gameEnd(false); Serial.println("[GAME] Wrong button (penalty)"); }
+      if (globalB > 0 && globalB == G.targetBtn) scheduleGameEnd(true);
+      else { scheduleGameEnd(false); Serial.println("[GAME] Wrong button (penalty)"); }
     }
   }
   else if (h->type == NODE_STATUS && len >= (int)sizeof(NodeStatusMsg)) {
@@ -891,6 +916,11 @@ static void handleCli(String s){
 }
 
 void loop(){
+  if (gEndPending){
+    gEndPending = false;
+    gameEnd(gEndWin);      // this runs in loop-context (like `poc end`)
+  }
+
   dripPump();
   flushLogs();
 

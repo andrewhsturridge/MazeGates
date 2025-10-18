@@ -231,6 +231,43 @@ static volatile uint8_t  rcNT         = 0;
 static volatile uint8_t  rcTargets[12];
 static volatile uint8_t  rcWalkBits[6];
 
+static void nodeEnterIdle(uint8_t epoch, uint8_t r, uint8_t g, uint8_t b){
+  if (epoch) currentEpoch = epoch;
+  nodeState = NODE_IDLE;
+  ledPending = false;
+  fillAllStrips(r,g,b);
+  Serial.printf("[STATE] -> IDLE  rgb(%u,%u,%u) epoch=%u\n", r,g,b,currentEpoch);
+  sendHello();  // ack to server
+}
+
+static void nodeEnterPlaying(uint8_t epoch){
+  if (epoch) currentEpoch = epoch;
+  nodeState = NODE_PLAYING;
+  ledPending = false;
+  fillAllStrips(0,0,0);
+  Serial.printf("[STATE] -> PLAYING epoch=%u\n", currentEpoch);
+  sendHello();  // ack to server
+}
+
+static void nodeEnterOver(uint8_t epoch, uint8_t r, uint8_t g, uint8_t b){
+  if (epoch) currentEpoch = epoch;
+  nodeState = NODE_OVER;
+  ledPending = false;
+  fillAllStrips(r,g,b);
+  Serial.printf("[STATE] -> OVER  rgb(%u,%u,%u) epoch=%u\n", r,g,b,currentEpoch);
+  sendHello();  // ack to server
+}
+
+static void applyGameStatePending(){
+  if (!statePending) return;
+  statePending = false;
+  uint8_t e = pendingEpoch, s = pendingState;
+  uint8_t r = pendingR, g = pendingG, b = pendingB;
+  if (s == NODE_PLAYING)      nodeEnterPlaying(e);
+  else if (s == NODE_OVER)    nodeEnterOver(e, r, g, b);
+  else                        nodeEnterIdle(e, r, g, b);
+}
+
 // ---------- ESP-NOW ----------
 static volatile bool gOtaPending = false;
 static char gOtaUrlBuf[200] = {0};
@@ -331,25 +368,13 @@ static void onNowRecv(const esp_now_recv_info* info, const uint8_t* data, int le
   if (h->type == GAME_STATE && len >= (int)sizeof(GameStateMsg)){
     const GameStateMsg* m = (const GameStateMsg*)data;
 
-    // Adopt epoch and state *now*
-    currentEpoch = h->pad;
-    nodeState = (m->state == NODE_PLAYING) ? NODE_PLAYING
-            : (m->state == NODE_OVER)    ? NODE_OVER
-                                          : NODE_IDLE;
-
-    // Hard stop paints after end: LED_RANGE will be ignored when not PLAYING
-    // Draw solid overlay immediately (buffered; render will show)
-    if (nodeState == NODE_PLAYING){
-      fillAllStrips(0,0,0);                // clear any previous overlay
-    } else {
-      fillAllStrips(m->r, m->g, m->b);     // win→green, loss→red (from server)
-    }
-
-    // If you still keep pending vars for loop, you can sync them here (optional):
-    pendingEpoch = currentEpoch;
-    pendingState = nodeState;
+    // Stage for the loop to apply atomically
+    pendingEpoch = h->pad;
+    pendingState = (m->state == NODE_PLAYING) ? NODE_PLAYING
+                : (m->state == NODE_OVER)    ? NODE_OVER
+                                              : NODE_IDLE;
     pendingR = m->r; pendingG = m->g; pendingB = m->b;
-    statePending = false;   // we've already applied it
+    statePending = true;        // <— let the loop do the actual fill
 
     return;
   }
@@ -884,19 +909,7 @@ void setup(){
 // ---------- Loop ----------
 void loop(){
   // 1) Apply pending GAME_STATE first (barrier)
-  if (statePending){
-    statePending = false;
-    currentEpoch = pendingEpoch;
-    nodeState    = pendingState;
-
-    if (nodeState == NODE_PLAYING){
-      // Clear any previous overlay so baseline is visible
-      fillAllStrips(0,0,0);
-    } else {
-      // Draw local overlay for OVER or IDLE
-      fillAllStrips(pendingR, pendingG, pendingB);
-    }
-  }
+  applyGameStatePending();
 
   // Apply round config immediately after PLAYING flips, and only for current epoch
   if (rcPending && nodeState == NODE_PLAYING){
