@@ -153,7 +153,7 @@ enum MsgType : uint8_t {
   GAME_STATE  = 90, ROUND_CFG = 92
 };
 
-enum NodeGameState : uint8_t { NODE_IDLE=0, NODE_PLAYING=1, NODE_OVER=2 };
+enum NodeGameState : uint8_t { NODE_IDLE=0, NODE_PLAYING=1, NODE_OVER=2, NODE_INTERMISSION=3 };
 static volatile uint8_t nodeState = NODE_IDLE;
 
 struct __attribute__((packed)) PktHeader { uint8_t type, version, nodeId, pad; uint16_t seq, len; };
@@ -231,6 +231,16 @@ static volatile uint8_t  rcNT         = 0;
 static volatile uint8_t  rcTargets[12];
 static volatile uint8_t  rcWalkBits[6];
 
+static uint32_t interNextToggle=0; static bool interOn=false;
+
+static void nodeEnterIntermission(uint8_t epoch){
+  if (epoch) currentEpoch = epoch;
+  nodeState = NODE_INTERMISSION;
+  ledPending = false;
+  interNextToggle = 0; interOn=false;
+  // first frame off; loop will blink
+}
+
 static void nodeEnterIdle(uint8_t epoch, uint8_t r, uint8_t g, uint8_t b){
   if (epoch) currentEpoch = epoch;
   nodeState = NODE_IDLE;
@@ -263,9 +273,10 @@ static void applyGameStatePending(){
   statePending = false;
   uint8_t e = pendingEpoch, s = pendingState;
   uint8_t r = pendingR, g = pendingG, b = pendingB;
-  if (s == NODE_PLAYING)      nodeEnterPlaying(e);
-  else if (s == NODE_OVER)    nodeEnterOver(e, r, g, b);
-  else                        nodeEnterIdle(e, r, g, b);
+  if (s == NODE_PLAYING)           nodeEnterPlaying(e);
+  else if (s == NODE_OVER)         nodeEnterOver(e, r, g, b);
+  else if (s == NODE_INTERMISSION) nodeEnterIntermission(e);
+  else                             nodeEnterIdle(e, r, g, b);
 }
 
 // ---------- ESP-NOW ----------
@@ -309,15 +320,42 @@ static void sendRaw(const uint8_t* mac, const uint8_t* data, size_t len){
 }
 
 static void sendHello(){ HelloMsg m{}; m.h={HELLO,PROTO_VER,gNodeId,0,gSeq++,sizeof(HelloMsg)}; m.role=1; m.caps=0; sendRaw(kBroadcast,(uint8_t*)&m,sizeof(m)); }
+// --- Gate event (epoch-tagged) ---
 static void sendGateEvent(uint8_t gateId, uint8_t ev, uint16_t strengthMm){
-  GateEventMsg m{}; m.h={GATE_EVENT,PROTO_VER,gNodeId,0,gSeq++,sizeof(GateEventMsg)};
-  m.gateId=gateId; m.ev=ev; m.strengthMm=strengthMm; m.tsMs=millis();
-  sendRaw(kBroadcast,(uint8_t*)&m,sizeof(m));
+  GateEventMsg m{};
+  // Header (fill fields explicitly)
+  m.h.type    = GATE_EVENT;
+  m.h.version = PROTO_VER;
+  m.h.nodeId  = gNodeId;
+  m.h.pad     = (uint8_t)currentEpoch;              // epoch tag
+  m.h.seq     = gSeq++;                             // uint16_t
+  m.h.len     = (uint16_t)sizeof(GateEventMsg);
+
+  // Body
+  m.gateId      = gateId;
+  m.ev          = ev;
+  m.strengthMm  = strengthMm;
+  m.tsMs        = millis();
+
+  sendRaw(kBroadcast, (uint8_t*)&m, sizeof(m));
 }
+// --- Button event (epoch-tagged) ---
 static void sendButtonEvent(uint8_t idx, uint8_t ev){
-  ButtonEventMsg m{}; m.h={BUTTON_EVENT,PROTO_VER,gNodeId,0,gSeq++,sizeof(ButtonEventMsg)};
-  m.btnIdx=idx; m.ev=ev; m.tsMs=millis();
-  sendRaw(kBroadcast,(uint8_t*)&m,sizeof(m));
+  ButtonEventMsg m{};
+  // Header
+  m.h.type    = BUTTON_EVENT;
+  m.h.version = PROTO_VER;
+  m.h.nodeId  = gNodeId;
+  m.h.pad     = (uint8_t)currentEpoch;              // epoch tag
+  m.h.seq     = gSeq++;
+  m.h.len     = (uint16_t)sizeof(ButtonEventMsg);
+
+  // Body
+  m.btnIdx = idx;
+  m.ev     = ev;
+  m.tsMs   = millis();
+
+  sendRaw(kBroadcast, (uint8_t*)&m, sizeof(m));
 }
 static void sendOtaAck(uint8_t status){ OtaAckMsg m{}; m.h={OTA_ACK,PROTO_VER,gNodeId,0,gSeq++,sizeof(OtaAckMsg)}; m.status=status; sendRaw(kBroadcast,(uint8_t*)&m,sizeof(m)); }
 
@@ -367,15 +405,15 @@ static void onNowRecv(const esp_now_recv_info* info, const uint8_t* data, int le
 
   if (h->type == GAME_STATE && len >= (int)sizeof(GameStateMsg)){
     const GameStateMsg* m = (const GameStateMsg*)data;
-
-    // Stage for the loop to apply atomically
     pendingEpoch = h->pad;
-    pendingState = (m->state == NODE_PLAYING) ? NODE_PLAYING
-                : (m->state == NODE_OVER)    ? NODE_OVER
-                                              : NODE_IDLE;
+    switch (m->state) {          // 0..3 come from the server
+      case 1: pendingState = NODE_PLAYING;      break; // W_PLAYING
+      case 2: pendingState = NODE_OVER;         break; // W_OVER
+      case 3: pendingState = NODE_INTERMISSION; break; // W_INTERMISSION  <— NEW
+      default: pendingState = NODE_IDLE;        break; // W_IDLE
+    }
     pendingR = m->r; pendingG = m->g; pendingB = m->b;
-    statePending = true;        // <— let the loop do the actual fill
-
+    statePending = true;
     return;
   }
 
@@ -406,10 +444,12 @@ static void onNowRecv(const esp_now_recv_info* info, const uint8_t* data, int le
     return;
   }
 
-  // LED_RANGE: ignore unless actively playing
+  // LED_RANGE:
+  //  - PLAYING: accept all
+  //  - other states: accept only overlay effect==1 (used for fail-flash)
   if (h->type == LED_RANGE && len >= (int)sizeof(LedRangeMsg)) {
-    if (nodeState != NODE_PLAYING) return;
     const LedRangeMsg* m = (const LedRangeMsg*)data;
+    if (nodeState != NODE_PLAYING && m->effect != 1) return;
     if (m->strip < stripCount && strips[m->strip]) {
       uint16_t end = m->start + m->count;
       if (end > cfg[m->strip].count) end = cfg[m->strip].count;
@@ -910,6 +950,16 @@ void setup(){
 void loop(){
   // 1) Apply pending GAME_STATE first (barrier)
   applyGameStatePending();
+
+  // Intermission blink (all gates)
+  if (nodeState == NODE_INTERMISSION){
+    uint32_t now = millis();
+    if (now >= interNextToggle){
+      interNextToggle = now + 400;  // 2.5 Hz
+      interOn = !interOn;
+      fillAllStrips(interOn ? 150 : 0, interOn ? 150 : 0, interOn ? 150 : 0); // white blink
+    }
+  }
 
   // Apply round config immediately after PLAYING flips, and only for current epoch
   if (rcPending && nodeState == NODE_PLAYING){
