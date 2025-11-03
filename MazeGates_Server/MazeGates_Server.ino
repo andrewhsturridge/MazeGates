@@ -23,6 +23,7 @@ static bool gFailGateBlinkEnabled = true;   // ← OFF for now
 static bool     gLenSweep     = false;   // toggle via CLI
 static uint8_t  gLenCursor    = 0;       // index within current level's [min..max]
 
+static bool gTestMode = false;
 
 // ======= Protocol =======
 enum MsgType : uint8_t {
@@ -483,27 +484,55 @@ static void tickFailFlash(){
 }
 
 static void processGateEvent(uint8_t gateId, uint8_t ev){
+  // When NOT playing, honor ToF visualization by sending an overlay frame (effect=1)
+  // so nodes accept LED_RANGE in any state. We only paint on ENTER events.
+  // (If you don't want tofvis during GAME_OVER, change the condition to:
+  //   if (G.st != PLAYING && G.st != GAME_OVER) { ... } )
   if (G.st != PLAYING){
     if (gTofVis && ev == 1){
       uint8_t nodeId, strip; uint16_t start, count;
-      if (routeGate(gateId, nodeId, strip, start, count))
-        sendLedRange(nodeId, strip, start, count, gTofR, gTofG, gTofB);
+      if (routeGate(gateId, nodeId, strip, start, count)){
+        LedRangeMsg m{};
+        m.h.type    = LED_RANGE;
+        m.h.version = PROTO_VER;
+        m.h.nodeId  = 0;
+        m.h.pad     = gEpoch;
+        m.h.seq     = gSeq++;
+        m.h.len     = (uint16_t)sizeof(LedRangeMsg);
+
+        m.strip     = strip;
+        m.start     = start;
+        m.count     = count;
+        m.effect    = 1;                 // << overlay so node accepts outside PLAYING
+        m.r         = gTofR;
+        m.g         = gTofG;
+        m.b         = gTofB;
+        m.durationMs= 0;
+
+        auto it = nodesById.find(nodeId);
+        if (it != nodesById.end()){
+          _enqueueTx(it->second.mac, &m, sizeof(m));
+        }
+      }
     }
     return;
   }
 
-  if (ev == 1){   // ENTER only matters
-    if (!isWalkable(gateId)){         // STRICT: wrong gate => fail + flash culprit
-      gFailGate = gateId; gFailBtn = 0;
+  // PLAYING: only ENTER matters, strict path enforcement
+  if (ev == 1){
+    if (!isWalkable(gateId)){           // Wrong gate -> fail; remember culprit
+      gFailGate = gateId;
+      gFailBtn  = 0;
       scheduleGameEnd(false);
       return;
     }
   }
 
+  // Paint this gate segment in green if walkable, red otherwise
   uint8_t nodeId, strip; uint16_t start, count;
   if (!routeGate(gateId, nodeId, strip, start, count)) return;
   const bool ok = isWalkable(gateId);
-  sendLedRange(nodeId, strip, start, count, ok?0:150, ok?150:0, 0);
+  sendLedRange(nodeId, strip, start, count, ok ? 0 : 150, ok ? 150 : 0, 0);
 }
 
 // ======= Lamps =======
@@ -696,7 +725,10 @@ static void onNowRecv(const esp_now_recv_info* info, const uint8_t* data, int le
     Serial.printf("HELLO from node %u (%s)\n", nid, macToStr(mac).c_str());
   }
   else if (h->type==GATE_EVENT && len >= (int)sizeof(GateEventMsg)){
-    if (h->pad != gEpoch) { Serial.printf("GATE (stale epoch %u != %u) ignored\n", h->pad, gEpoch); return; }
+    if (h->pad != gEpoch && !gTestMode && !gTofVis) {
+      Serial.printf("GATE (stale epoch %u != %u) ignored\n", h->pad, gEpoch);
+      return;
+    }
     auto *m=(const GateEventMsg*)data;
     Serial.printf("GATE %u %s mm=%u from node %u\n",
                   m->gateId,(m->ev==1?"ENTER":(m->ev==2?"EXIT":"?")),m->strengthMm,h->nodeId);
@@ -707,7 +739,10 @@ static void onNowRecv(const esp_now_recv_info* info, const uint8_t* data, int le
     Serial.printf("OTA_ACK from node %u (status=%u)\n", h->nodeId, m->status);
   }
   else if (h->type==BUTTON_EVENT && len >= (int)sizeof(ButtonEventMsg)){
-    if (h->pad != gEpoch) { Serial.printf("BUTTON (stale epoch %u != %u) ignored\n", h->pad, gEpoch); return; }
+    if (h->pad != gEpoch && !gTestMode && !gBtnEcho) {
+      Serial.printf("BUTTON (stale epoch %u != %u) ignored\n", h->pad, gEpoch);
+      return;
+    }
     const ButtonEventMsg* m = (const ButtonEventMsg*)data;
     Serial.printf("BUTTON%u %s from node %u\n",
                   m->btnIdx, (m->ev==1?"PRESS":"RELEASE"), h->nodeId);
@@ -793,6 +828,7 @@ static void printHelp(){
   Serial.println("  poc start <seconds>   (B4 target; walkable: 39,28,17,6)");
   Serial.println("  poc end");
   Serial.println("  test lengths on|off");
+  Serial.println("  test on | test off");
 }
 
 static void printLedMap(int filterNodeId){
@@ -1121,14 +1157,20 @@ static void handleCli(String s){
   // tofvis
   if (s.startsWith("tofvis")){
     int r=0,g=0,b=255;
-    if (s=="tofvis on"){ gTofVis=true; Serial.println("ToF visualization: ON (blue)"); return; }
+    if (s=="tofvis on"){
+      gTofVis=true;
+      sendGameStateBroadcast(W_PLAYING, 0,0,0); // nodes sense during tofvis
+      Serial.println("ToF visualization: ON (blue) [nodes set to PLAYING]");
+      return;
+    }
     if (s=="tofvis off"){ gTofVis=false; Serial.println("ToF visualization: OFF"); return; }
     if (sscanf(s.c_str(),"tofvis on %d %d %d",&r,&g,&b)==3){
       if (r<0) r=0; if (r>255) r=255;
       if (g<0) g=0; if (g>255) g=255;
       if (b<0) b=0; if (b>255) b=255;
       gTofR=(uint8_t)r; gTofG=(uint8_t)g; gTofB=(uint8_t)b; gTofVis=true;
-      Serial.printf("ToF visualization: ON rgb(%d,%d,%d)\n", r,g,b);
+      sendGameStateBroadcast(W_PLAYING, 0,0,0);
+      Serial.printf("ToF visualization: ON rgb(%d,%d,%d) [nodes set to PLAYING]\n", r,g,b);
       return;
     }
     Serial.println("usage: tofvis on|off  OR  tofvis on <r> <g> <b>");
@@ -1166,6 +1208,24 @@ static void handleCli(String s){
   if (s == "poc end"){
     gameEnd(false);
     Serial.println("[POC] END");
+    return;
+  }
+
+  if (s=="test on"){
+    gTestMode = true;
+    gBtnEcho  = true;   // convenience: lamp pulses on press
+    gTofVis   = true;   // convenience: enable segment paint
+    sendGameStateBroadcast(W_PLAYING, 0,0,0);  // nodes start sensing (node PLAYING)
+    Serial.println("[TEST] ON: nodes PLAYING; epoch bypass for TOF (and buttons via echo)");
+    return;
+  }
+
+  if (s=="test off"){
+    gTestMode = false;
+    gBtnEcho  = false;
+    gTofVis   = false;
+    sendGameStateBroadcast(W_IDLE, 0,0,0);     // nodes stop sensing
+    Serial.println("[TEST] OFF");
     return;
   }
 
