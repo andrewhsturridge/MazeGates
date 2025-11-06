@@ -49,9 +49,9 @@ enum GameStateWire : uint8_t { W_IDLE=0, W_PLAYING=1, W_OVER=2, W_INTERMISSION=3
 // --- Level plan (1 maze per level for now)
 struct LevelPlan { uint8_t nMazes; uint16_t mazeSecs; uint8_t minLen, maxLen; };
 static const LevelPlan kLevels[3] = {
-  {1, 40,  4,  6},   // Easy
-  {1, 30,  7, 10},   // Medium
-  {1, 20, 11, 15},   // Hard
+  {3, 40,  4,  6},   // Easy
+  {3, 30,  7, 10},   // Medium
+  {99, 20, 11, 15},   // Hard
 };
 
 // --- Run context
