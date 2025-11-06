@@ -25,6 +25,10 @@ static uint8_t  gLenCursor    = 0;       // index within current level's [min..m
 
 static bool gTestMode = false;
 
+// Track OTA start and completion (server-side inference)
+static std::map<uint8_t, uint32_t> lastOtaStartMs;       // nodeId -> millis() when we sent OTA_START
+static std::map<uint8_t, uint32_t> lastUpdateCompleteMs; // nodeId -> millis() when we inferred success
+
 // ======= Protocol =======
 enum MsgType : uint8_t {
   HELLO=1, HELLO_REQ=2, CLAIM=3,
@@ -261,6 +265,9 @@ static void sendOtaStart(uint8_t nodeId, const String& url){
   memset(m.url, 0, sizeof(m.url));
   if (url.length()>0) strncpy(m.url, url.c_str(), sizeof(m.url)-1);
   sendRaw(it->second.mac,(uint8_t*)&m,sizeof(m));
+
+  // NEW: remember when this OTA was triggered
+  lastOtaStartMs[nodeId] = millis();
 }
 
 // ======= ROUND_CFG sender =======
@@ -774,6 +781,20 @@ static void onNowRecv(const esp_now_recv_info* info, const uint8_t* data, int le
     lastStatus[h->nodeId] = { m->uptimeMs, m->initedMask, m->errStreakMax, {0}, millis() };
     memcpy(lastStatus[h->nodeId].reinitCount, m->reinitCount, 8);
     logNodeStatus(h->nodeId, m);
+
+    // NEW: infer update completion if the node rebooted shortly after an OTA_START we sent
+    uint32_t nowMs = millis();
+    auto itStart = lastOtaStartMs.find(h->nodeId);
+    if (itStart != lastOtaStartMs.end()){
+      bool freshBoot = (m->uptimeMs <= 5000);              // 5s since boot = just restarted
+      bool withinWnd = (nowMs - itStart->second) <= 120000; // 2 min window after OTA start
+      if (freshBoot && withinWnd){
+        lastUpdateCompleteMs[h->nodeId] = nowMs;           // mark completion time
+        // optional: clear start marker so we don’t re-mark on next status
+        lastOtaStartMs.erase(itStart);
+        qlogf("UPDATE COMPLETE inferred for node %u", h->nodeId);
+      }
+    }
   }
   else if (h->type == LED_MAP_RSP && len >= (int)sizeof(LedMapRsp)) {
     const LedMapRsp* r = (const LedMapRsp*)data;
@@ -1047,12 +1068,24 @@ static void handleCli(String s){
 
   if (s=="status"){
     bcastHelloReq();
-    Serial.println("node  uptime(s)  inited  maxErr  reinitCounts");
+    Serial.println("node  uptime(s)  inited  maxErr  reinitCounts                 lastUpdate(s ago)");
     for (auto &kv : lastStatus) {
       auto nid = kv.first; const auto &st = kv.second;
+      uint32_t nowMs = millis();
+      int32_t ageSec = -1;
+      auto it = lastUpdateCompleteMs.find(nid);
+      if (it != lastUpdateCompleteMs.end()){
+        uint32_t ageMs = nowMs - it->second;
+        ageSec = (int32_t)(ageMs / 1000UL);
+      }
+
       Serial.printf("%3u  %9lu   0x%02X     %3u   [",
                     nid, (unsigned)(st.uptimeMs/1000), st.initedMask, st.errStreakMax);
-      for (int i=0;i<8;i++) { Serial.printf("%u%s", st.reinitCount[i], i==7?"]\n":","); }
+      for (int i=0;i<8;i++) { Serial.printf("%u%s", st.reinitCount[i], i==7?"]   ":" ,"); }
+
+      if (ageSec >= 0) Serial.printf("%6d", ageSec);
+      else             Serial.printf("     -");
+      Serial.println();
     }
     return;
   }

@@ -21,8 +21,8 @@
 
 // ---------- OTA defaults ----------
 #ifndef OTA_SSID
-#define OTA_SSID "GUD"
-#define OTA_PASS "EscapE66"
+#define OTA_SSID "AndrewiPhone"
+#define OTA_PASS "12345678"
 #define OTA_BASE_URL "http://192.168.2.231:8000/"
 #define OTA_NODE_PATH "MazeGates/MazeGates_Node/build/esp32.esp32.um_feathers3/MazeGates_Node.ino.bin"
 #endif
@@ -155,6 +155,8 @@ enum MsgType : uint8_t {
 
 enum NodeGameState : uint8_t { NODE_IDLE=0, NODE_PLAYING=1, NODE_OVER=2, NODE_INTERMISSION=3 };
 static volatile uint8_t nodeState = NODE_IDLE;
+// Armed = sensors are allowed to send events (only after ROUND_CFG applied)
+static volatile bool nodeArmed = false;
 
 struct __attribute__((packed)) PktHeader { uint8_t type, version, nodeId, pad; uint16_t seq, len; };
 static const uint8_t PROTO_VER = 1;
@@ -233,10 +235,25 @@ static volatile uint8_t  rcWalkBits[6];
 
 static uint32_t interNextToggle=0; static bool interOn=false;
 
+static bool chPresent[8] = {0,0,0,0,0,0,0,0};
+static bool chNeedsClearAfterArm[8] = {0,0,0,0,0,0,0,0};
+
+static uint32_t lastEnterSentMs[8] = {0};
+#define ENTER_COOLDOWN_MS 150   // 0 = off; 150ms ≈ ~6–7 msgs/sec max per ch
+
+static void resetPresenceForNewRound(){
+  for (uint8_t i=0;i<8;i++){
+    chPresent[i] = false;
+    chNeedsClearAfterArm[i] = true;   // must see one clear frame before first ENTER
+    lastEnterSentMs[i] = 0;           // optional: drop any cooldown history
+  }
+}
+
 static void nodeEnterIntermission(uint8_t epoch){
   if (epoch) currentEpoch = epoch;
   nodeState = NODE_INTERMISSION;
   ledPending = false;
+  nodeArmed = false;                 // ← disarm
   interNextToggle = 0; interOn=false;
   // first frame off; loop will blink
 }
@@ -245,27 +262,28 @@ static void nodeEnterIdle(uint8_t epoch, uint8_t r, uint8_t g, uint8_t b){
   if (epoch) currentEpoch = epoch;
   nodeState = NODE_IDLE;
   ledPending = false;
+  nodeArmed = false;                 // ← disarm
   fillAllStrips(r,g,b);
   Serial.printf("[STATE] -> IDLE  rgb(%u,%u,%u) epoch=%u\n", r,g,b,currentEpoch);
-  sendHello();  // ack to server
 }
 
 static void nodeEnterPlaying(uint8_t epoch){
   if (epoch) currentEpoch = epoch;
   nodeState = NODE_PLAYING;
   ledPending = false;
+  nodeArmed = false;                 // not armed until ROUND_CFG is applied
+  resetPresenceForNewRound();        // ← NEW: require “clear once” per channel
   fillAllStrips(0,0,0);
   Serial.printf("[STATE] -> PLAYING epoch=%u\n", currentEpoch);
-  sendHello();  // ack to server
 }
 
 static void nodeEnterOver(uint8_t epoch, uint8_t r, uint8_t g, uint8_t b){
   if (epoch) currentEpoch = epoch;
   nodeState = NODE_OVER;
   ledPending = false;
+  nodeArmed = false;                 // ← disarm
   fillAllStrips(r,g,b);
   Serial.printf("[STATE] -> OVER  rgb(%u,%u,%u) epoch=%u\n", r,g,b,currentEpoch);
-  sendHello();  // ack to server
 }
 
 static void applyGameStatePending(){
@@ -818,9 +836,6 @@ static void reinitIfNeeded(uint8_t i, const char* why) {
   errStreak[i] = 0;
 }
 
-static uint32_t lastEnterSentMs[8] = {0};
-#define ENTER_COOLDOWN_MS 150   // 0 = off; 150ms ≈ ~6–7 msgs/sec max per ch
-
 static void pollOne(uint8_t i) {
   if (!inited[i]) return;
 
@@ -872,14 +887,31 @@ static void pollOne(uint8_t i) {
     i2cBusy=false;
 
     if (updated) {
-      uint8_t gate = tofGateByCh[ch];
-      if (gate) {
-        uint32_t nowMs = millis();
-        if (ENTER_COOLDOWN_MS == 0 || (nowMs - lastEnterSentMs[ch]) >= ENTER_COOLDOWN_MS) {
-          sendGateEvent(gate, /*ENTER*/1, mm);
-          lastEnterSentMs[ch] = nowMs;
-        }
+      // We detected a valid target on channel ch
+      // If we haven't seen a clear frame since arming, suppress until it's clear once.
+      if (chNeedsClearAfterArm[ch]) {
+        chPresent[ch] = true;    // remember it's currently present
+        return;                  // but DO NOT send ENTER yet
       }
+
+      // Rising-edge only: send ENTER only when transitioning from not present -> present
+      if (!chPresent[ch]) {
+        uint8_t gate = tofGateByCh[ch];
+        if (gate) {
+          uint32_t nowMs = millis();
+          if (ENTER_COOLDOWN_MS == 0 || (nowMs - lastEnterSentMs[ch]) >= ENTER_COOLDOWN_MS) {
+            sendGateEvent(gate, /*ENTER*/1, mm);
+            lastEnterSentMs[ch] = nowMs;
+          }
+        }
+        chPresent[ch] = true;
+      }
+    } else {
+      // No valid target this poll -> mark clear.
+      if (chPresent[ch]) chPresent[ch] = false;
+
+      // The first clear frame after arming unlocks this channel.
+      if (chNeedsClearAfterArm[ch]) chNeedsClearAfterArm[ch] = false;
     }
   } else {
     tcaDeselectAll();
@@ -974,11 +1006,13 @@ void loop(){
       // local paint + target lamps
       nodePaintWalkable(walkBits);
       applyTargetsOnThisNode(nT, targets);
+
+      nodeArmed = true;      // ← SENSORS MAY NOW SEND EVENTS
     }
   }
 
   // 2) Sensing only while playing (buttons + ToF)
-  const bool doSense = (nodeState == NODE_PLAYING) && !gOtaMode;
+  const bool doSense = (nodeState == NODE_PLAYING) && nodeArmed && !gOtaMode;
   if (doSense){
     for (uint8_t ch=0; ch<8; ch++) pollOne(ch);
     pollButtons();
