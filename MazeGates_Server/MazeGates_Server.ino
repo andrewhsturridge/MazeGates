@@ -54,6 +54,29 @@ static const LevelPlan kLevels[3] = {
   {99, 20, 11, 15},   // Hard
 };
 
+// ======= Lives / retry same round =======
+//  - 5 lives per session (no refill)
+//  - Any fail (wrong gate, wrong button, maze timeout) costs ONE life
+//  - On life-loss with lives remaining: show culprit feedback (white room, blink culprit red),
+//    then enter intermission (all gates blink white) and restart SAME difficulty.
+static const uint8_t  kStartLives      = 5;
+static const uint32_t kLifeFeedbackMs  = 2400;   // 6 toggles @ 400ms ≈ 3 red flashes
+
+static uint8_t gLivesRemaining = kStartLives;    // reset on gameStart()
+static bool    gRetrySameRound  = false;         // consumed after intermission
+
+// Life-loss feedback is deferred (WiFi task -> loop())
+static volatile bool    gLifeFeedbackPending = false;
+static uint32_t         gLifeFeedbackUntil   = 0;   // 0 when not in feedback
+static volatile uint8_t gLifeCulpritGate     = 0;   // 1..44 or 0
+static volatile uint8_t gLifeCulpritBtn      = 0;   // 1..12 or 0
+
+// NOTE: Keep the *definition* of this below the protocol structs.
+// Arduino's sketch preprocessor may auto-generate function prototypes near the top of the file;
+// if a function is defined before the protocol structs, those auto-prototypes can end up before
+// the type declarations and cause "does not name a type" errors.
+static void handleFailWithLives(uint8_t culpritGate, uint8_t culpritBtn);
+
 // --- Run context
 static uint32_t gGameDeadlineMs = 0;        // 5 min absolute end
 static uint8_t  gLevelIdx = 0;              // 0=Easy,1=Med,2=Hard
@@ -434,6 +457,25 @@ static inline void scheduleGameEnd(bool win){
   gEndPending = true;
 }
 
+// Lives helper (definition intentionally placed after protocol structs)
+static void handleFailWithLives(uint8_t culpritGate, uint8_t culpritBtn){
+  if (culpritGate > 44) culpritGate = 0;
+  if (culpritBtn  > 12) culpritBtn  = 0;
+
+  if (gLivesRemaining > 1){
+    gLivesRemaining--;
+    gRetrySameRound = true;                 // do NOT advance level/length after intermission
+    gLifeCulpritGate = culpritGate;
+    gLifeCulpritBtn  = culpritBtn;
+    gLifeFeedbackPending = true;            // loop() will start the feedback visuals
+    Serial.printf("[LIFE] Lost one. Lives left=%u (retry same difficulty)\n", gLivesRemaining);
+  } else {
+    gLivesRemaining = 0;
+    Serial.println("[LIFE] No lives left -> GAME OVER");
+    scheduleGameEnd(false);
+  }
+}
+
 static void enterIntermission(){
   G.st = WAITING;                         // stop processing gates
   gIntermissionUntil = millis() + 5000;   // 5 s
@@ -452,7 +494,8 @@ static void beginFailFlashButton(uint8_t btn){
   gFailBlinkNext  = 0; gFailBlinkOn = false;
 }
 static void tickFailFlash(){
-  if (G.st != GAME_OVER){
+  // Run culprit blink both for GAME_OVER and for life-loss feedback stage.
+  if (G.st != GAME_OVER && gLifeFeedbackUntil == 0 && !gEndPending){
     gFailBlinkUntil = 0;
     gFailGate = 0;
     gFailBtn  = 0;
@@ -477,7 +520,7 @@ static void tickFailFlash(){
     if (routeGate(gFailGate, nid, strip, start, count)){
       LedRangeMsg m{}; m.h={LED_RANGE,PROTO_VER,0,gEpoch,gSeq++,(uint16_t)sizeof(LedRangeMsg)};
       m.strip=strip; m.start=start; m.count=count; m.effect=1;        // overlay frame
-      if (gFailBlinkOn){ m.r=150; m.g=150; m.b=150; } else { m.r=150; m.g=0; m.b=0; } // white <-> red
+      if (gFailBlinkOn){ m.r=150; m.g=0;   m.b=0;   } else { m.r=150; m.g=150; m.b=150; } // red <-> white
       auto it = nodesById.find(nid); if (it != nodesById.end()) _enqueueTx(it->second.mac,&m,sizeof(m));
       flushTxQueueQuickly(60);                                        // <— ensure it gets out NOW
     } else {
@@ -527,10 +570,11 @@ static void processGateEvent(uint8_t gateId, uint8_t ev){
 
   // PLAYING: only ENTER matters, strict path enforcement
   if (ev == 1){
-    if (!isWalkable(gateId)){           // Wrong gate -> fail; remember culprit
+    if (!isWalkable(gateId)){           // Wrong gate -> lose a life
       gFailGate = gateId;
       gFailBtn  = 0;
-      scheduleGameEnd(false);
+      G.st = WAITING;                   // freeze server logic immediately
+      handleFailWithLives(gateId, 0);
       return;
     }
   }
@@ -570,6 +614,14 @@ static void gameStart(uint32_t seconds){
   gMazesDoneInLevel = 0;
   gIntermissionUntil = 0;
 
+  // Lives reset (no refill during a session)
+  gLivesRemaining = kStartLives;
+  gRetrySameRound = false;
+  gLifeFeedbackPending = false;
+  gLifeFeedbackUntil   = 0;
+  gLifeCulpritGate = 0;
+  gLifeCulpritBtn  = 0;
+
   gFailGate = 0; gFailBtn = 0;
   gFailBlinkUntil = 0; gFailBlinkNext = 0; gFailBlinkOn = false;
 
@@ -589,6 +641,12 @@ static void gameStart(uint32_t seconds){
 
 // in gameEnd(bool win)
 static void gameEnd(bool win){
+  // Cancel any in-flight life-feedback sequence
+  gLifeFeedbackPending = false;
+  gLifeFeedbackUntil   = 0;
+  gRetrySameRound      = false;
+  gIntermissionUntil   = 0;
+
   G.st = GAME_OVER;
   G.deadlineMs = 0;
   gGameDeadlineMs = 0;                 // stop global timer
@@ -771,8 +829,10 @@ static void onNowRecv(const esp_now_recv_info* info, const uint8_t* data, int le
         // Maze success -> intermission, then next maze
         enterIntermission();
       } else {
-        gFailGate = 0; gFailBtn = (globalB>0)?(uint8_t)globalB:0;
-        scheduleGameEnd(false);
+        gFailGate = 0;
+        gFailBtn  = (globalB>0)?(uint8_t)globalB:0;
+        G.st = WAITING;                 // freeze server logic immediately
+        handleFailWithLives(0, gFailBtn);
       }
     }
   }
@@ -1270,18 +1330,61 @@ void loop(){
   // Finish a deferred end (we already added this scheduler earlier)
   if (gEndPending){ gEndPending=false; gameEnd(gEndWin); }
 
+  // Life-loss feedback (white room + blink culprit red) is started here (NOT in esp_now callback)
+  if (gLifeFeedbackPending){
+    gLifeFeedbackPending = false;
+
+    // Base coat: all gates solid white (culprit will blink red over it)
+    sendGameStateToAll(W_IDLE, 150,150,150);
+
+    // Turn off all target lamps during feedback (culprit button, if any, will be blinked by tickFailFlash)
+    setAllLamps(false);
+
+    // Arm culprit blink (tickFailFlash will do the toggling)
+    gFailGate = gLifeCulpritGate;
+    gFailBtn  = gLifeCulpritBtn;
+
+    gFailBlinkUntil = millis() + kLifeFeedbackMs;
+    gLifeFeedbackUntil = gFailBlinkUntil;
+
+    gFailBlinkNext = 0;
+    gFailBlinkOn   = false;  // first toggle => ON (red / lamp on)
+
+    Serial.printf("[LIFE] Feedback: culprit gate=%u btn=%u (%lums)\n",
+                  gFailGate, gFailBtn, (unsigned long)kLifeFeedbackMs);
+  }
+
+  // Feedback finished -> intermission (all-gates white blink), then restart same difficulty
+  if (gLifeFeedbackUntil && (int32_t)(millis() - gLifeFeedbackUntil) >= 0){
+    gLifeFeedbackUntil = 0;
+
+    // stop blinking
+    gFailBlinkUntil = 0;
+    gFailGate = 0;
+    gFailBtn  = 0;
+    gFailBlinkNext = 0;
+    gFailBlinkOn   = false;
+
+    enterIntermission();
+  }
+
   // Intermission auto-advance
   if (gIntermissionUntil && (int32_t)(millis() - gIntermissionUntil) >= 0){
     gIntermissionUntil = 0;
-    if (gLenSweep){
+
+    if (gRetrySameRound){
+      // Life was lost -> restart SAME difficulty (no progression)
+      gRetrySameRound = false;
+    } else if (gLenSweep){
       // Move to next length within this level; then roll to next level
       const auto &L = kLevels[gLevelIdx];
       uint8_t count = (uint8_t)(L.maxLen - L.minLen + 1);
       if (++gLenCursor >= count){ gLenCursor = 0; gLevelIdx = (uint8_t)((gLevelIdx+1)%3); }
     } else {
-      // your existing per-level advancement
+      // existing per-level advancement
       if (++gMazesDoneInLevel >= kLevels[gLevelIdx].nMazes){ gMazesDoneInLevel = 0; gLevelIdx = (uint8_t)((gLevelIdx+1)%3); }
     }
+
     startMaze(gLevelIdx);
   }
 
@@ -1292,8 +1395,11 @@ void loop(){
 
   // Maze timer (strict -> fail)
   if (G.st == PLAYING && G.deadlineMs > 0 && (millis() - G.t0) > G.deadlineMs){
-    gFailGate = 0; gFailBtn = 0;               // timer-based fail has no culprit
-    scheduleGameEnd(false);
+    // Timeout costs a life. Treat the target button as the "culprit" (you didn't hit it in time).
+    gFailGate = 0;
+    gFailBtn  = (G.targetBtn >= 1 && G.targetBtn <= 12) ? G.targetBtn : 0;
+    G.st = WAITING;                 // freeze server logic immediately
+    handleFailWithLives(0, gFailBtn);
   }
 
   // Drive fail-blink if active
