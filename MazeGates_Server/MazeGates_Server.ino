@@ -60,7 +60,10 @@ static const LevelPlan kLevels[3] = {
 //  - On life-loss with lives remaining: show culprit feedback (white room, blink culprit red),
 //    then enter intermission (all gates blink white) and restart SAME difficulty.
 static const uint8_t  kStartLives      = 5;
-static const uint32_t kLifeFeedbackMs  = 2400;   // 6 toggles @ 400ms ≈ 3 red flashes
+static const uint32_t kLifeFeedbackMs  = 4000;   // 10 toggles @ 400ms ≈ 5 red flashes
+
+// Per-maze success flash (green) before intermission blink
+static const uint32_t kSuccessFeedbackMs = 1200;
 
 static uint8_t gLivesRemaining = kStartLives;    // reset on gameStart()
 static bool    gRetrySameRound  = false;         // consumed after intermission
@@ -71,6 +74,10 @@ static uint32_t         gLifeFeedbackUntil   = 0;   // 0 when not in feedback
 static volatile uint8_t gLifeCulpritGate     = 0;   // 1..44 or 0
 static volatile uint8_t gLifeCulpritBtn      = 0;   // 1..12 or 0
 
+// Per-maze success feedback is deferred (like life-loss feedback)
+static volatile bool    gSuccessFeedbackPending = false;
+static uint32_t         gSuccessFeedbackUntil   = 0;
+
 // NOTE: Keep the *definition* of this below the protocol structs.
 // Arduino's sketch preprocessor may auto-generate function prototypes near the top of the file;
 // if a function is defined before the protocol structs, those auto-prototypes can end up before
@@ -78,10 +85,11 @@ static volatile uint8_t gLifeCulpritBtn      = 0;   // 1..12 or 0
 static void handleFailWithLives(uint8_t culpritGate, uint8_t culpritBtn);
 
 // --- Run context
-static uint32_t gGameDeadlineMs = 0;        // 5 min absolute end
-static uint8_t  gLevelIdx = 0;              // 0=Easy,1=Med,2=Hard
-static uint8_t  gMazesDoneInLevel = 0;
+static uint32_t gGameDeadlineMs = 0;        // session absolute end (win if survive X minutes)
+static uint16_t gStage = 0;                 // increments on each successful maze (no advance on life loss)
+static bool     gAdvanceStagePending = false;
 static uint32_t gIntermissionUntil = 0;     // 0 when not in intermission
+
 
 // Culprit tracking for fail flash
 static uint8_t  gFailGate = 0;              // nonzero => wrong gate
@@ -434,6 +442,90 @@ static bool genPathSimple(uint8_t start, const Adj& endSet, uint8_t Lmin, uint8_
   return dfsPathNoTouch(start, &endSet, Lmin, Lmax, used, path, /*len=*/1, outPath, &outLen);
 }
 
+// Branch-path generator for "tree" mazes (2 targets).
+// Produces a self-avoiding branch (no-touch within the branch). Optionally also avoids
+// being 4-adjacent to ANY trunk gate except the current gate (strict spacing).
+static bool dfsBranchNoTouch(uint8_t at,
+                             const Adj *endSet,
+                             uint8_t Lmin, uint8_t Lmax,
+                             const uint8_t *trunk, uint8_t trunkLen,
+                             bool used[45],
+                             uint8_t path[46], uint8_t len,
+                             uint8_t outPath[46], uint8_t *outLen,
+                             bool avoidTouchToTrunk)
+{
+  // Accept when within band and at an end gate (adjacent to chosen button)
+  if (len >= Lmin){
+    for (uint8_t i=0; i<endSet->n; ++i){
+      if (at == endSet->v[i]){
+        memcpy(outPath, path, len);
+        *outLen = len;
+        return true;
+      }
+    }
+  }
+  if (len == Lmax) return false;
+
+  uint8_t nn = GADJ[at].n;
+  uint8_t order[6];
+  for (uint8_t i=0;i<nn;i++) order[i] = GADJ[at].v[i];
+  shuffle(order, nn);
+
+  for (uint8_t i=0;i<nn;i++){
+    uint8_t nb = order[i];
+    if (used[nb]) continue;
+
+    // Self-avoid within the branch: nb must NOT touch any earlier branch place (except current)
+    bool touchesOld = false;
+    for (uint8_t k=0; k + 1 < len; ++k){
+      if (isAdjGate(nb, path[k])){ touchesOld = true; break; }
+    }
+    if (touchesOld) continue;
+
+    // Optional: keep at least one-gate spacing from the trunk, to make the maze visually "tree-like".
+    if (avoidTouchToTrunk){
+      for (uint8_t k=0; k<trunkLen; ++k){
+        uint8_t tg = trunk[k];
+        if (tg == at) continue;                 // allow adjacency to the current gate (needed at the branch point)
+        if (isAdjGate(nb, tg)){ touchesOld = true; break; }
+      }
+      if (touchesOld) continue;
+    }
+
+    used[nb] = true;
+    path[len] = nb;
+    if (dfsBranchNoTouch(nb, endSet, Lmin, Lmax, trunk, trunkLen, used, path, len+1, outPath, outLen, avoidTouchToTrunk))
+      return true;
+    used[nb] = false;
+  }
+  return false;
+}
+
+static bool genBranchPath(uint8_t branchStart, const Adj& endSet,
+                          uint8_t Lmin, uint8_t Lmax,
+                          const uint8_t trunkPath[46], uint8_t trunkLen,
+                          uint8_t outPath[46], uint8_t &outLen,
+                          bool avoidTouchToTrunk)
+{
+  bool used[45] = {0};
+
+  // Block overlap with the trunk (tree = trunk ∪ branch; they may share ONLY the branch point)
+  for (uint8_t i=0; i<trunkLen; ++i){
+    uint8_t g = trunkPath[i];
+    if (g>=1 && g<=44) used[g] = true;
+  }
+
+  uint8_t path[46];
+  path[0] = branchStart;
+  outLen  = 0;
+
+  return dfsBranchNoTouch(branchStart, &endSet, Lmin, Lmax,
+                          trunkPath, trunkLen,
+                          used, path, /*len=*/1,
+                          outPath, &outLen,
+                          avoidTouchToTrunk);
+}
+
 // Build walkBits from a path
 static void buildWalkBitsFromPath(const uint8_t* path, uint8_t n, uint8_t wb[6]){
   clearBits(wb);
@@ -444,8 +536,34 @@ static void buildWalkBitsFromPath(const uint8_t* path, uint8_t n, uint8_t wb[6])
 static bool gTofVis=false; static uint8_t gTofR=0, gTofG=0, gTofB=255;
 
 enum GameState { WAITING=0, PLAYING=1, GAME_OVER=2 };
-struct Round { GameState st; uint8_t targetBtn; uint32_t t0; uint32_t deadlineMs; };
-static Round G{WAITING, 0, 0, 0};
+
+struct Round {
+  GameState st;
+
+  uint8_t  nTargets;        // 0..12
+  uint8_t  targets[12];     // global buttons (1..12)
+  uint16_t targetsMask;     // bit i => button i required (1..12)
+  uint16_t hitMask;         // bit i => button i already hit
+
+  uint32_t t0;
+  uint32_t deadlineMs;
+};
+
+static Round G = { WAITING, 0, {0}, 0, 0, 0, 0 };
+
+static inline uint16_t btnBit(uint8_t b){
+  return (b >= 1 && b <= 12) ? (uint16_t)(1u << b) : 0;
+}
+
+static uint8_t firstRemainingTargetBtn(){
+  for (uint8_t i=0; i<G.nTargets && i<12; ++i){
+    uint8_t b = G.targets[i];
+    uint16_t bit = btnBit(b);
+    if (bit && !(G.hitMask & bit)) return b;
+  }
+  return 0;
+}
+
 
 // Defer GAME_OVER out of onNowRecv
 static volatile bool gEndPending = false;
@@ -479,6 +597,7 @@ static void handleFailWithLives(uint8_t culpritGate, uint8_t culpritBtn){
 static void enterIntermission(){
   G.st = WAITING;                         // stop processing gates
   gIntermissionUntil = millis() + 5000;   // 5 s
+  setAllLamps(false);                     // keep buttons dark while players reset to safe positions
   sendGameStateToAll(W_INTERMISSION, 0,0,0);
   Serial.println("[MAZE] INTERMISSION 5s");
 }
@@ -607,20 +726,23 @@ static void setTargetLamp(uint8_t btn, bool on){
 // change signature you already adopted:
 static void gameStart(uint32_t seconds){
 
-  gLenCursor = 0;            // start at min length for the level
+  gLenCursor = 0;            // length-sweep cursor (only used when 'test lengths on')
 
   // Full reset
-  gLevelIdx = 0;
-  gMazesDoneInLevel = 0;
+  gStage = 0;
+  gAdvanceStagePending = false;
   gIntermissionUntil = 0;
 
-  // Lives reset (no refill during a session)
+// Lives reset (no refill during a session)
   gLivesRemaining = kStartLives;
   gRetrySameRound = false;
   gLifeFeedbackPending = false;
   gLifeFeedbackUntil   = 0;
   gLifeCulpritGate = 0;
   gLifeCulpritBtn  = 0;
+
+  gSuccessFeedbackPending = false;
+  gSuccessFeedbackUntil   = 0;
 
   gFailGate = 0; gFailBtn = 0;
   gFailBlinkUntil = 0; gFailBlinkNext = 0; gFailBlinkOn = false;
@@ -635,8 +757,8 @@ static void gameStart(uint32_t seconds){
   if (seconds == 0) seconds = 300;
   gGameDeadlineMs = millis() + seconds * 1000UL;
 
-  Serial.printf("[GAME] START %lus strict multi-maze\n", (unsigned)seconds);
-  startMaze(gLevelIdx);
+  Serial.printf("[GAME] START %lus (stage progression)\n", (unsigned)seconds);
+  startMaze();
 }
 
 // in gameEnd(bool win)
@@ -645,7 +767,12 @@ static void gameEnd(bool win){
   gLifeFeedbackPending = false;
   gLifeFeedbackUntil   = 0;
   gRetrySameRound      = false;
+  gAdvanceStagePending = false;
   gIntermissionUntil   = 0;
+
+  // Cancel any in-flight success feedback
+  gSuccessFeedbackPending = false;
+  gSuccessFeedbackUntil   = 0;
 
   G.st = GAME_OVER;
   G.deadlineMs = 0;
@@ -668,35 +795,131 @@ static void gameEnd(bool win){
   Serial.printf("[GAME] END (%s) epoch=%u\n", win ? "WIN" : "FAIL", gEpoch);
 }
 
-static bool startMaze(uint8_t levelIdx){
+static bool startMaze(){
   // Reset any fail-blink state between mazes
   gFailGate = 0; gFailBtn  = 0;
   gFailBlinkUntil = 0; gFailBlinkNext = 0; gFailBlinkOn = false;
 
-  const auto &L = kLevels[levelIdx];
+  // ---- Stage-based progression ----
+  //  - Each success: stage++ (handled after intermission)
+  //  - main path length increases with stage (clamped)
+  //  - maze time decreases slightly with stage (clamped)
+  //  - once length hits the "hard" band, introduce 2-target tree mazes (order doesn't matter)
+  uint8_t  mainLen  = 0;     // desired trunk length (gates, includes start)
+  uint16_t mazeSecs = 0;
+  uint8_t  wantTargets = 1;
+  uint8_t  branchLen = 0;    // desired branch length (gates, includes branch point)
 
-  // Choose start (39..44) and a random button
-  uint8_t start = (uint8_t)random(39,45);
-  uint8_t btn   = (uint8_t)random(1,13);
-
-  // Length selection (supports test-lengths sweep)
-  uint8_t minLen = L.minLen, maxLen = L.maxLen;
   if (gLenSweep){
-    uint8_t forcedLen = (uint8_t)(L.minLen + gLenCursor);
-    minLen = maxLen = forcedLen;
+    // Test tool: sweep exact lengths 4..15 with the legacy time buckets
+    mainLen = (uint8_t)(4 + gLenCursor);
+    if (mainLen < 4)  mainLen = 4;
+    if (mainLen > 15) mainLen = 15;
+    mazeSecs = (mainLen <= 6) ? 40 : (mainLen <= 10) ? 30 : 20;
+  } else {
+    uint16_t rawLen = (uint16_t)4 + gStage;
+    mainLen = (rawLen > 15) ? 15 : (uint8_t)rawLen;
+
+    int t = 40 - (int)gStage;     // 1s less per stage (clamped)
+    if (t < 20) t = 20;
+    mazeSecs = (uint16_t)t;
   }
 
-  // Try to find a path that lands adjacent to the button
-  uint8_t path[46]; uint8_t plen=0;
-  bool ok=false;
-  for (int tries=0; tries<300 && !ok; ++tries){
-    start = (uint8_t)random(39,45);
-    btn   = (uint8_t)random(1,13);
-    ok = genPathSimple(start, BADJ[btn], minLen, maxLen, path, plen);  // << use minLen/maxLen
-  }
-  if (!ok){ Serial.println("[MAZE] generator failed"); return false; }
+  wantTargets = (mainLen >= 11) ? 2 : 1;  // introduce multi-target once the trunk is long
+  branchLen = (uint8_t)(mainLen / 2);
+  if (branchLen < 4) branchLen = 4;
+  if (branchLen > 7) branchLen = 7;
 
-  uint8_t wb[6]; buildWalkBitsFromPath(path, plen, wb);
+  // ---- Generate maze ----
+  uint8_t start = 0;
+
+  uint8_t targets[12] = {0};
+  uint8_t nTargets = 0;
+
+  uint8_t mainPath[46];   uint8_t mainPlen   = 0;
+  uint8_t branchPath[46]; uint8_t branchPlen = 0;
+
+  uint8_t wb[6]; clearBits(wb);
+
+  bool ok = false;
+
+  // 2-target tree: trunk reaches target A, branch reaches target B.
+  if (wantTargets == 2){
+    for (int tries=0; tries<650 && !ok; ++tries){
+      start = (uint8_t)random(39, 45);
+
+      uint8_t btnA = (uint8_t)random(1, 13);
+      uint8_t btnB = (uint8_t)random(1, 13);
+      if (btnB == btnA) continue;
+
+      // Trunk: exact length
+      if (!genPathSimple(start, BADJ[btnA], mainLen, mainLen, mainPath, mainPlen)) continue;
+      if (mainPlen < 4) continue;  // need interior nodes to branch cleanly
+
+      // Try multiple branch points along the trunk (exclude the trunk end gate)
+      for (int bpTry=0; bpTry<140 && !ok; ++bpTry){
+        uint8_t idx = (uint8_t)random(1, (int)mainPlen - 1);  // 1..mainPlen-2
+        if (idx == 0 || idx >= mainPlen-1) continue;
+        uint8_t bp = mainPath[idx];
+
+        uint8_t bMin = branchLen;
+        uint8_t bMax = (uint8_t)(branchLen + 1);
+        if (bMax > 15) bMax = 15;
+
+        // Branch generator: strict trunk spacing first, then relaxed as fallback
+        bool okBr = genBranchPath(bp, BADJ[btnB], bMin, bMax, mainPath, mainPlen, branchPath, branchPlen, true);
+        if (!okBr) okBr = genBranchPath(bp, BADJ[btnB], bMin, bMax, mainPath, mainPlen, branchPath, branchPlen, false);
+        if (!okBr) continue;
+
+        // Union bits trunk + branch
+        clearBits(wb);
+        for (uint8_t i=0;i<mainPlen;i++)   setBit(wb, mainPath[i]);
+        for (uint8_t i=0;i<branchPlen;i++) setBit(wb, branchPath[i]);
+
+        targets[0] = btnA;
+        targets[1] = btnB;
+        nTargets   = 2;
+        ok         = true;
+      }
+    }
+  }
+
+  // 1-target fallback / default
+  if (!ok){
+    for (int tries=0; tries<500 && !ok; ++tries){
+      start = (uint8_t)random(39, 45);
+      uint8_t btn = (uint8_t)random(1, 13);
+      if (genPathSimple(start, BADJ[btn], mainLen, mainLen, mainPath, mainPlen)){
+        buildWalkBitsFromPath(mainPath, mainPlen, wb);
+        targets[0] = btn;
+        nTargets   = 1;
+        ok         = true;
+      }
+    }
+  }
+
+  // Final fallback: relax length band ±1 if the exact-length generator struggled
+  if (!ok){
+    uint8_t Lmin = (mainLen > 4)   ? (uint8_t)(mainLen - 1) : mainLen;
+    uint8_t Lmax = (mainLen < 15)  ? (uint8_t)(mainLen + 1) : mainLen;
+
+    for (int tries=0; tries<600 && !ok; ++tries){
+      start = (uint8_t)random(39, 45);
+      uint8_t btn = (uint8_t)random(1, 13);
+      if (genPathSimple(start, BADJ[btn], Lmin, Lmax, mainPath, mainPlen)){
+        buildWalkBitsFromPath(mainPath, mainPlen, wb);
+        targets[0] = btn;
+        nTargets   = 1;
+        ok         = true;
+      }
+    }
+  }
+
+  if (!ok){
+    Serial.println("[MAZE] generator failed");
+    return false;
+  }
+
   setWalkableFromBits(wb);
 
   // Epoch bump so nodes accept fresh config
@@ -705,19 +928,36 @@ static bool startMaze(uint8_t levelIdx){
   // Flip nodes to PLAYING and send round config
   sendGameStateToAll(W_PLAYING, 0,0,0);
   delay(10);
-  const uint8_t targets[1] = { btn };
-  sendRoundCfg(targets, 1, wb);
+  sendRoundCfg(targets, nTargets, wb);
 
-  // Arm the maze timer
+  // Arm the maze timer + targets
   G.st = PLAYING;
-  G.targetBtn = btn;
-  G.t0 = millis();
-  G.deadlineMs = (uint32_t)L.mazeSecs * 1000UL;
+  G.nTargets = nTargets;
+  memset(G.targets, 0, sizeof(G.targets));
+  for (uint8_t i=0;i<nTargets && i<12;i++) G.targets[i] = targets[i];
+  G.targetsMask = 0;
+  for (uint8_t i=0;i<nTargets && i<12;i++) G.targetsMask |= btnBit(G.targets[i]);
+  G.hitMask = 0;
 
-  Serial.printf("[MAZE] L%d start=G%u len=%u%s -> Btn%u\n",
-                (int)levelIdx+1, start, plen, gLenSweep?" (forced)":"", btn);
+  G.t0 = millis();
+  G.deadlineMs = (uint32_t)mazeSecs * 1000UL;
+
+  // Log
+  Serial.printf("[MAZE] stage=%u len=%u time=%us%s start=G%u targets=",
+                (unsigned)gStage, (unsigned)mainPlen, (unsigned)mazeSecs,
+                gLenSweep ? " (sweep)" : "", start);
+
+  for (uint8_t i=0;i<nTargets;i++){
+    Serial.printf("%sB%u", (i ? "," : ""), targets[i]);
+  }
+  if (nTargets == 2){
+    Serial.printf(" (tree: trunk=%u branch=%u)", (unsigned)mainPlen, (unsigned)branchPlen);
+  }
+  Serial.println();
+
   return true;
 }
+
 
 // ======= RX =======
 static void logNodeStatus(uint8_t nodeId, const NodeStatusMsg* m) {
@@ -785,6 +1025,13 @@ static void onNowRecv(const esp_now_recv_info* info, const uint8_t* data, int le
   auto *h=(const PktHeader*)data; if (h->version!=PROTO_VER) return;
   const uint8_t* mac = info->src_addr;
 
+  // Auto-learn any node that talks to us (not just HELLO), so unicast LED_RANGE/LAMP_CTRL
+  // always works even if a node missed HELLO_REQ at boot.
+  if (h->nodeId != 0 && nodesById.find(h->nodeId) == nodesById.end()){
+    addOrUpdateNode(h->nodeId, mac);
+    Serial.printf("DISCOVER node %u (%s) via msg=%u\n", h->nodeId, macToStr(mac).c_str(), h->type);
+  }
+
   if (h->type==HELLO){
     uint8_t nid=h->nodeId; addOrUpdateNode(nid, mac);
     Serial.printf("HELLO from node %u (%s)\n", nid, macToStr(mac).c_str());
@@ -825,14 +1072,39 @@ static void onNowRecv(const esp_now_recv_info* info, const uint8_t* data, int le
     }
 
     if (G.st == PLAYING && m->ev == 1){
-      if (globalB > 0 && globalB == G.targetBtn){
-        // Maze success -> intermission, then next maze
-        enterIntermission();
+      if (globalB > 0){
+        uint16_t bit = btnBit((uint8_t)globalB);
+
+        if (bit && (G.targetsMask & bit)){
+          // Correct target (order doesn't matter). Turn it off once it's collected.
+          if (!(G.hitMask & bit)){
+            G.hitMask |= bit;
+
+            uint8_t nid,lidx;
+            if (getDefaultBtnLamp((uint8_t)globalB, nid, lidx)){
+              sendLampCtrl(nid, lidx, false);
+            }
+          }
+
+          // All targets hit -> success
+          if (G.targetsMask && ((G.hitMask & G.targetsMask) == G.targetsMask)){
+            gAdvanceStagePending = true;
+            G.st = WAITING;                 // freeze server logic immediately
+            gSuccessFeedbackPending = true; // loop() will show green success then start intermission
+          }
+        } else {
+          // Wrong button -> lose a life
+          gFailGate = 0;
+          gFailBtn  = (uint8_t)globalB;
+          G.st = WAITING;                 // freeze server logic immediately
+          handleFailWithLives(0, gFailBtn);
+        }
       } else {
+        // Unmapped button -> lose a life (no specific culprit button)
         gFailGate = 0;
-        gFailBtn  = (globalB>0)?(uint8_t)globalB:0;
-        G.st = WAITING;                 // freeze server logic immediately
-        handleFailWithLives(0, gFailBtn);
+        gFailBtn  = 0;
+        G.st = WAITING;
+        handleFailWithLives(0, 0);
       }
     }
   }
@@ -902,6 +1174,7 @@ static void printHelp(){
   Serial.println("  ledmap <nodeId> <pin:count>[,<pin:count>...]");
   Serial.println("  ota <nodeId> [url]");
   Serial.println("  ota all [url]");
+  Serial.println("    sample url: http://172.20.10.3:8000/MazeGates/MazeGates_Node/build/esp32.esp32.um_feathers3/MazeGates_Node.ino.bin");
   Serial.println("  status");
   Serial.println("  tofvis on|off  (optional: tofvis on <r> <g> <b>)");
   Serial.println("  tofmap get <nodeId> | tofmap get all");
@@ -1278,7 +1551,13 @@ static void handleCli(String s){
     int secs = 20; sscanf(s.c_str(), "poc start %d", &secs);
 
     gEpoch++;                 // new epoch
-    G.st = PLAYING; G.targetBtn = 4; G.t0 = millis();
+    G.st = PLAYING;
+    G.nTargets = 1;
+    memset(G.targets, 0, sizeof(G.targets));
+    G.targets[0] = 4;
+    G.targetsMask = btnBit(4);
+    G.hitMask = 0;
+    G.t0 = millis();
     G.deadlineMs = secs > 0 ? (uint32_t)secs * 1000UL : 0;
 
     sendGameStateBroadcast(W_PLAYING, 0,0,0);
@@ -1354,6 +1633,25 @@ void loop(){
                   gFailGate, gFailBtn, (unsigned long)kLifeFeedbackMs);
   }
 
+  // Maze success feedback (solid green) is started here (NOT in esp_now callback)
+  if (gSuccessFeedbackPending && !gLifeFeedbackUntil && !gIntermissionUntil && !gEndPending){
+    gSuccessFeedbackPending = false;
+
+    // Stop any blink state just in case
+    gFailBlinkUntil = 0;
+    gFailGate = 0;
+    gFailBtn  = 0;
+    gFailBlinkNext = 0;
+    gFailBlinkOn   = false;
+
+    // Solid green "success" flash
+    sendGameStateToAll(W_IDLE, 0, 150, 0);
+    setAllLamps(false);
+
+    gSuccessFeedbackUntil = millis() + kSuccessFeedbackMs;
+    Serial.printf("[MAZE] SUCCESS feedback (%lums)\n", (unsigned long)kSuccessFeedbackMs);
+  }
+
   // Feedback finished -> intermission (all-gates white blink), then restart same difficulty
   if (gLifeFeedbackUntil && (int32_t)(millis() - gLifeFeedbackUntil) >= 0){
     gLifeFeedbackUntil = 0;
@@ -1368,6 +1666,12 @@ void loop(){
     enterIntermission();
   }
 
+  // Success feedback finished -> intermission (all-gates white blink), then advance stage
+  if (gSuccessFeedbackUntil && (int32_t)(millis() - gSuccessFeedbackUntil) >= 0){
+    gSuccessFeedbackUntil = 0;
+    if (!gIntermissionUntil) enterIntermission();
+  }
+
   // Intermission auto-advance
   if (gIntermissionUntil && (int32_t)(millis() - gIntermissionUntil) >= 0){
     gIntermissionUntil = 0;
@@ -1375,17 +1679,22 @@ void loop(){
     if (gRetrySameRound){
       // Life was lost -> restart SAME difficulty (no progression)
       gRetrySameRound = false;
-    } else if (gLenSweep){
-      // Move to next length within this level; then roll to next level
-      const auto &L = kLevels[gLevelIdx];
-      uint8_t count = (uint8_t)(L.maxLen - L.minLen + 1);
-      if (++gLenCursor >= count){ gLenCursor = 0; gLevelIdx = (uint8_t)((gLevelIdx+1)%3); }
+      gAdvanceStagePending = false;   // safety: don't accidentally advance
     } else {
-      // existing per-level advancement
-      if (++gMazesDoneInLevel >= kLevels[gLevelIdx].nMazes){ gMazesDoneInLevel = 0; gLevelIdx = (uint8_t)((gLevelIdx+1)%3); }
+      // Maze success -> stage++ (unless we're in length-sweep test mode)
+      if (!gLenSweep && gAdvanceStagePending){
+        gStage++;
+      }
+      gAdvanceStagePending = false;
+
+      // Test tool: length sweep 4..15 (do not touch stage)
+      if (gLenSweep){
+        const uint8_t count = (uint8_t)(15 - 4 + 1);  // 12 lengths
+        if (++gLenCursor >= count) gLenCursor = 0;
+      }
     }
 
-    startMaze(gLevelIdx);
+    startMaze();
   }
 
   // Game hard timer -> win
@@ -1397,7 +1706,7 @@ void loop(){
   if (G.st == PLAYING && G.deadlineMs > 0 && (millis() - G.t0) > G.deadlineMs){
     // Timeout costs a life. Treat the target button as the "culprit" (you didn't hit it in time).
     gFailGate = 0;
-    gFailBtn  = (G.targetBtn >= 1 && G.targetBtn <= 12) ? G.targetBtn : 0;
+    gFailBtn  = firstRemainingTargetBtn();
     G.st = WAITING;                 // freeze server logic immediately
     handleFailWithLives(0, gFailBtn);
   }
