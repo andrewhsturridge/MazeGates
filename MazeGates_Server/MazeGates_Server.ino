@@ -1,10 +1,38 @@
 /*
- * Maze Gates – Server Harness v0 (clean compile)
- * Board: ESP32 (any), Transport: ESP-NOW ch.6
- * CLI: help, hello, roster, claim, setgate, fakegate, walkable, pushwalkable,
- * path set, lamp, ledmap (set/show/get), ota, ota all, status, tofvis, tofmap get/set,
- * btnmap, btnlamp, game start/end, poc start/end.
+ * Maze Gates – Server Harness
+ *
+ * With standardized serial protocol for the main Player Management System (PMS)
+ *
+ * Standard protocol lines always start with:
+ *   !PMS
+ *
+ * PMS protocol (v1) ***DO NOT REMOVE***:
+ *   PMS -> Server:
+ *     !PMS PING
+ *     !PMS START level=1        (level selects difficulty 1..3 for Maze Gates)
+ *     !PMS STOP
+ *
+ *   Server -> PMS:
+ *     !PMS PONG v=1 game=mazegates role=server
+ *     !PMS STATUS v=1 state=arming|playing level=.. score=.. lives=.. tleft_ms=.. last_reason=..
+ *       (STATUS is NOT emitted while idle)
+ *     !PMS EVENT v=1 name=game_start level=..
+ *     !PMS EVENT v=1 name=game_end reason=timeup|no_lives|stopped score=.. lives=..
+ *     !PMS EVENT v=1 name=score delta=.. total=.. bonus=0|1
+ *     !PMS EVENT v=1 name=life delta=-1 lives=..
+ *
+ * Notes:
+ *   - One message per line, newline '\n' terminated.
+ *   - PMS should only parse lines starting with "!PMS" (ignore everything else).
+ *   - No ACK/ERR by design (PMS infers success from STATUS/EVENT).
+ *
+ * Build toggles (compile-time):
+ *   - PMS_STD_ENABLED: enable/disable PMS protocol support
+ *   - PMS_DEBUG_SERIAL: when 0, suppress non-!PMS Serial prints (clean PMS output)
+ *
+ * Transport: ESP-NOW ch.6 (unchanged)
  */
+
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -17,6 +45,42 @@
 
 #include "MazeGates_Map.h"   // shared: GATE_MAP and BTN_DEFAULT
 
+
+// =============================================================
+// PMS / Serial standardization toggles
+// =============================================================
+
+// Use PMS_SERIAL for all !PMS output (never suppressed)
+#define PMS_SERIAL Serial
+
+// 1 = Enable PMS standard protocol parsing/output.
+// 0 = Legacy-only (original behavior).
+#ifndef PMS_STD_ENABLED
+#define PMS_STD_ENABLED 1
+#endif
+
+// 1 = Keep legacy/debug Serial prints (help banners, CLI confirmations, logs).
+// 0 = Suppress all non-!PMS output (recommended for production PMS wiring).
+#ifndef PMS_DEBUG_SERIAL
+#define PMS_DEBUG_SERIAL 1
+#endif
+
+// PMS STATUS tick period (ms)
+#ifndef PMS_STATUS_PERIOD_MS
+#define PMS_STATUS_PERIOD_MS 250
+#endif
+
+#if PMS_DEBUG_SERIAL
+  // Variadic macros allow DBG_PRINTLN() with no args (prints a newline)
+  #define DBG_PRINT(...)    PMS_SERIAL.print(__VA_ARGS__)
+  #define DBG_PRINTLN(...)  PMS_SERIAL.println(__VA_ARGS__)
+  #define DBG_PRINTF(...)   PMS_SERIAL.printf(__VA_ARGS__)
+#else
+  #define DBG_PRINT(...)    do { } while (0)
+  #define DBG_PRINTLN(...)  do { } while (0)
+  #define DBG_PRINTF(...)   do { } while (0)
+#endif
+
 // Temporary kill-switch: gate segment blink on FAIL
 static bool gFailGateBlinkEnabled = true;   // ← OFF for now
 // Test: sweep one maze per length within each level's range
@@ -24,6 +88,13 @@ static bool     gLenSweep     = false;   // toggle via CLI
 static uint8_t  gLenCursor    = 0;       // index within current level's [min..max]
 
 static bool gTestMode = false;
+
+
+// ======= PMS reporting state =======
+static uint8_t  gPmsLevel     = 1;      // last START level (1..3)
+static uint32_t gPmsScore     = 0;      // total correct button presses (PMS score)
+static uint16_t gStartStage   = 0;      // stage offset used to approximate difficulty selection
+static const char* gPmsEndReason = "stopped"; // used for EVENT name=game_end (timeup|no_lives|stopped)
 
 // Track OTA start and completion (server-side inference)
 static std::map<uint8_t, uint32_t> lastOtaStartMs;       // nodeId -> millis() when we sent OTA_START
@@ -206,7 +277,7 @@ static void qlogf(const char* fmt, ...) {
 }
 static void flushLogs() {
   while (logHead != logTail) {
-    Serial.println(logQ[logHead]);
+    DBG_PRINTLN(logQ[logHead]);
     logHead = (uint8_t)((logHead + 1) % LOG_Q_SIZE);
   }
 }
@@ -586,10 +657,11 @@ static void handleFailWithLives(uint8_t culpritGate, uint8_t culpritBtn){
     gLifeCulpritGate = culpritGate;
     gLifeCulpritBtn  = culpritBtn;
     gLifeFeedbackPending = true;            // loop() will start the feedback visuals
-    Serial.printf("[LIFE] Lost one. Lives left=%u (retry same difficulty)\n", gLivesRemaining);
+    DBG_PRINTF("[LIFE] Lost one. Lives left=%u (retry same difficulty)\n", gLivesRemaining);
   } else {
     gLivesRemaining = 0;
-    Serial.println("[LIFE] No lives left -> GAME OVER");
+    gPmsEndReason = "no_lives";
+    DBG_PRINTLN("[LIFE] No lives left -> GAME OVER");
     scheduleGameEnd(false);
   }
 }
@@ -599,7 +671,7 @@ static void enterIntermission(){
   gIntermissionUntil = millis() + 5000;   // 5 s
   setAllLamps(false);                     // keep buttons dark while players reset to safe positions
   sendGameStateToAll(W_INTERMISSION, 0,0,0);
-  Serial.println("[MAZE] INTERMISSION 5s");
+  DBG_PRINTLN("[MAZE] INTERMISSION 5s");
 }
 
 static void beginFailFlashGate(uint8_t gate){
@@ -643,7 +715,7 @@ static void tickFailFlash(){
       auto it = nodesById.find(nid); if (it != nodesById.end()) _enqueueTx(it->second.mac,&m,sizeof(m));
       flushTxQueueQuickly(60);                                        // <— ensure it gets out NOW
     } else {
-      Serial.printf("[FAIL] routeGate(G%u) failed; no blink\n", gFailGate);
+      DBG_PRINTF("[FAIL] routeGate(G%u) failed; no blink\n", gFailGate);
     }
   } else if (gFailBtn){
     uint8_t nid,lidx; if (getDefaultBtnLamp(gFailBtn, nid, lidx)){
@@ -729,7 +801,12 @@ static void gameStart(uint32_t seconds){
   gLenCursor = 0;            // length-sweep cursor (only used when 'test lengths on')
 
   // Full reset
-  gStage = 0;
+  gStage = gStartStage;
+  gStartStage = 0;
+
+  // PMS score resets on every START
+  gPmsScore = 0;
+  gPmsEndReason = "stopped";
   gAdvanceStagePending = false;
   gIntermissionUntil = 0;
 
@@ -757,7 +834,7 @@ static void gameStart(uint32_t seconds){
   if (seconds == 0) seconds = 300;
   gGameDeadlineMs = millis() + seconds * 1000UL;
 
-  Serial.printf("[GAME] START %lus (stage progression)\n", (unsigned)seconds);
+  DBG_PRINTF("[GAME] START %lus (stage progression)\n", (unsigned)seconds);
   startMaze();
 }
 
@@ -792,7 +869,7 @@ static void gameEnd(bool win){
     gFailBlinkUntil = 0; gFailBlinkNext = 0; gFailBlinkOn = false;
   }
 
-  Serial.printf("[GAME] END (%s) epoch=%u\n", win ? "WIN" : "FAIL", gEpoch);
+  DBG_PRINTF("[GAME] END (%s) epoch=%u\n", win ? "WIN" : "FAIL", gEpoch);
 }
 
 static bool startMaze(){
@@ -916,7 +993,7 @@ static bool startMaze(){
   }
 
   if (!ok){
-    Serial.println("[MAZE] generator failed");
+    DBG_PRINTLN("[MAZE] generator failed");
     return false;
   }
 
@@ -943,17 +1020,17 @@ static bool startMaze(){
   G.deadlineMs = (uint32_t)mazeSecs * 1000UL;
 
   // Log
-  Serial.printf("[MAZE] stage=%u len=%u time=%us%s start=G%u targets=",
+  DBG_PRINTF("[MAZE] stage=%u len=%u time=%us%s start=G%u targets=",
                 (unsigned)gStage, (unsigned)mainPlen, (unsigned)mazeSecs,
                 gLenSweep ? " (sweep)" : "", start);
 
   for (uint8_t i=0;i<nTargets;i++){
-    Serial.printf("%sB%u", (i ? "," : ""), targets[i]);
+    DBG_PRINTF("%sB%u", (i ? "," : ""), targets[i]);
   }
   if (nTargets == 2){
-    Serial.printf(" (tree: trunk=%u branch=%u)", (unsigned)mainPlen, (unsigned)branchPlen);
+    DBG_PRINTF(" (tree: trunk=%u branch=%u)", (unsigned)mainPlen, (unsigned)branchPlen);
   }
-  Serial.println();
+  DBG_PRINTLN();
 
   return true;
 }
@@ -962,23 +1039,23 @@ static bool startMaze(){
 // ======= RX =======
 static void logNodeStatus(uint8_t nodeId, const NodeStatusMsg* m) {
   const uint8_t mask = m->initedMask;
-  Serial.printf("STATUS node %u up=%lus ", nodeId, (unsigned)(m->uptimeMs/1000));
-  Serial.print("up_ch=[");
-  bool first=true; for (int ch=0; ch<8; ++ch) if (mask & (1u<<ch)){ if(!first)Serial.print(","); Serial.print(ch); first=false; }
-  Serial.print("] down_ch=[");
-  first=true; for (int ch=0; ch<8; ++ch) if (!(mask & (1u<<ch))){ if(!first)Serial.print(","); Serial.print(ch); first=false; }
-  Serial.print("] ");
-  Serial.printf("maxErr=%u\n", m->errStreakMax);
+  DBG_PRINTF("STATUS node %u up=%lus ", nodeId, (unsigned)(m->uptimeMs/1000));
+  DBG_PRINT("up_ch=[");
+  bool first=true; for (int ch=0; ch<8; ++ch) if (mask & (1u<<ch)){ if(!first)DBG_PRINT(","); DBG_PRINT(ch); first=false; }
+  DBG_PRINT("] down_ch=[");
+  first=true; for (int ch=0; ch<8; ++ch) if (!(mask & (1u<<ch))){ if(!first)DBG_PRINT(","); DBG_PRINT(ch); first=false; }
+  DBG_PRINT("] ");
+  DBG_PRINTF("maxErr=%u\n", m->errStreakMax);
 }
 
 static void printNodeLedMap(uint8_t nodeId, const LedMapRsp* r){
-  Serial.printf("LEDMAP node %u: ", nodeId);
+  DBG_PRINTF("LEDMAP node %u: ", nodeId);
   for (uint8_t i=0; i<r->n && i<5; ++i){
-    if (i) Serial.print(", ");
-    Serial.printf("%u:%u", r->e[i].pin, r->e[i].count);
+    if (i) DBG_PRINT(", ");
+    DBG_PRINTF("%u:%u", r->e[i].pin, r->e[i].count);
   }
-  if (r->n == 0) Serial.print("(none)");
-  Serial.println();
+  if (r->n == 0) DBG_PRINT("(none)");
+  DBG_PRINTLN();
 }
 
 static void sendLedMapReq(uint8_t nodeId){
@@ -987,37 +1064,37 @@ static void sendLedMapReq(uint8_t nodeId){
   sendRaw(it->second.mac, (uint8_t*)&h, sizeof(h));
 }
 static void sendBtnPinsReq(uint8_t nodeId){
-  auto it = nodesById.find(nodeId); if (it==nodesById.end()) { Serial.println("Unknown nodeId"); return; }
+  auto it = nodesById.find(nodeId); if (it==nodesById.end()) { DBG_PRINTLN("Unknown nodeId"); return; }
   PktHeader h{ BTN_PINS_REQ, PROTO_VER, 0,0, gSeq++, (uint16_t)sizeof(PktHeader) };
   sendRaw(it->second.mac,(uint8_t*)&h,sizeof(h));
 }
 static void sendBtnPinsSet(uint8_t nodeId, const uint8_t *pins, uint8_t n){
-  auto it = nodesById.find(nodeId); if (it==nodesById.end()) { Serial.println("Unknown nodeId"); return; }
+  auto it = nodesById.find(nodeId); if (it==nodesById.end()) { DBG_PRINTLN("Unknown nodeId"); return; }
   BtnPinsMsg m{}; m.h.type=BTN_PINS; m.h.version=PROTO_VER; m.h.nodeId=0; m.h.pad=0; m.h.seq=gSeq++; m.h.len=sizeof(BtnPinsMsg);
   m.n=n; for (uint8_t i=0;i<n;i++) m.pin[i]=pins[i];
   _enqueueTx(it->second.mac,&m,sizeof(m));
 }
 static void printBtnPins(uint8_t nodeId, const BtnPinsRsp* r){
-  Serial.printf("BTNPINS node %u: ", nodeId);
-  if (r->n==0){ Serial.println("(none)"); return; }
-  for (uint8_t i=0;i<r->n;i++){ if (i) Serial.print(", "); Serial.printf("%u", r->pin[i]); }
-  Serial.println();
+  DBG_PRINTF("BTNPINS node %u: ", nodeId);
+  if (r->n==0){ DBG_PRINTLN("(none)"); return; }
+  for (uint8_t i=0;i<r->n;i++){ if (i) DBG_PRINT(", "); DBG_PRINTF("%u", r->pin[i]); }
+  DBG_PRINTLN();
 }
 static void sendTofMapReq(uint8_t nodeId){
-  auto it = nodesById.find(nodeId); if (it==nodesById.end()){ Serial.println("Unknown nodeId"); return; }
+  auto it = nodesById.find(nodeId); if (it==nodesById.end()){ DBG_PRINTLN("Unknown nodeId"); return; }
   PktHeader h{ TOF_MAP_REQ, PROTO_VER, 0,0, gSeq++, (uint16_t)sizeof(PktHeader) };
   sendRaw(it->second.mac, (uint8_t*)&h, sizeof(h));
 }
 static void sendTofMapSet(uint8_t nodeId, const uint8_t g[8]){
-  auto it = nodesById.find(nodeId); if (it==nodesById.end()){ Serial.println("Unknown nodeId"); return; }
+  auto it = nodesById.find(nodeId); if (it==nodesById.end()){ DBG_PRINTLN("Unknown nodeId"); return; }
   TofMapMsg m{}; m.h.type=TOF_MAP; m.h.version=PROTO_VER; m.h.nodeId=0; m.h.pad=0; m.h.seq=gSeq++; m.h.len=sizeof(TofMapMsg);
   memcpy(m.g, g, 8);
   _enqueueTx(it->second.mac, &m, sizeof(m));
 }
 static void printTofMap(uint8_t nodeId, const TofMapRsp* r){
-  Serial.printf("TOFMAP node %u: ", nodeId);
-  for (int i=0;i<8;i++){ if (i) Serial.print(","); Serial.printf("%u", r->g[i]); }
-  Serial.println();
+  DBG_PRINTF("TOFMAP node %u: ", nodeId);
+  for (int i=0;i<8;i++){ if (i) DBG_PRINT(","); DBG_PRINTF("%u", r->g[i]); }
+  DBG_PRINTLN();
 }
 
 static void onNowRecv(const esp_now_recv_info* info, const uint8_t* data, int len){
@@ -1029,38 +1106,38 @@ static void onNowRecv(const esp_now_recv_info* info, const uint8_t* data, int le
   // always works even if a node missed HELLO_REQ at boot.
   if (h->nodeId != 0 && nodesById.find(h->nodeId) == nodesById.end()){
     addOrUpdateNode(h->nodeId, mac);
-    Serial.printf("DISCOVER node %u (%s) via msg=%u\n", h->nodeId, macToStr(mac).c_str(), h->type);
+    DBG_PRINTF("DISCOVER node %u (%s) via msg=%u\n", h->nodeId, macToStr(mac).c_str(), h->type);
   }
 
   if (h->type==HELLO){
     uint8_t nid=h->nodeId; addOrUpdateNode(nid, mac);
-    Serial.printf("HELLO from node %u (%s)\n", nid, macToStr(mac).c_str());
+    DBG_PRINTF("HELLO from node %u (%s)\n", nid, macToStr(mac).c_str());
   }
   else if (h->type==GATE_EVENT && len >= (int)sizeof(GateEventMsg)){
     if (h->pad != gEpoch && !gTestMode && !gTofVis) {
-      Serial.printf("GATE (stale epoch %u != %u) ignored\n", h->pad, gEpoch);
+      DBG_PRINTF("GATE (stale epoch %u != %u) ignored\n", h->pad, gEpoch);
       return;
     }
     auto *m=(const GateEventMsg*)data;
-    Serial.printf("GATE %u %s mm=%u from node %u\n",
+    DBG_PRINTF("GATE %u %s mm=%u from node %u\n",
                   m->gateId,(m->ev==1?"ENTER":(m->ev==2?"EXIT":"?")),m->strengthMm,h->nodeId);
     processGateEvent(m->gateId, m->ev);
   }
   else if (h->type==OTA_ACK && len>=(int)sizeof(OtaAckMsg)){
     auto *m=(const OtaAckMsg*)data;
-    Serial.printf("OTA_ACK from node %u (status=%u)\n", h->nodeId, m->status);
+    DBG_PRINTF("OTA_ACK from node %u (status=%u)\n", h->nodeId, m->status);
   }
   else if (h->type==BUTTON_EVENT && len >= (int)sizeof(ButtonEventMsg)){
     if (h->pad != gEpoch && !gTestMode && !gBtnEcho) {
-      Serial.printf("BUTTON (stale epoch %u != %u) ignored\n", h->pad, gEpoch);
+      DBG_PRINTF("BUTTON (stale epoch %u != %u) ignored\n", h->pad, gEpoch);
       return;
     }
     const ButtonEventMsg* m = (const ButtonEventMsg*)data;
-    Serial.printf("BUTTON%u %s from node %u\n",
+    DBG_PRINTF("BUTTON%u %s from node %u\n",
                   m->btnIdx, (m->ev==1?"PRESS":"RELEASE"), h->nodeId);
 
     const int globalB = defaultGlobalBtnFrom(h->nodeId, m->btnIdx);
-    if (globalB > 0) Serial.printf("  => B%d (default)\n", globalB);
+    if (globalB > 0) DBG_PRINTF("  => B%d (default)\n", globalB);
 
     if (gBtnEcho && m->ev == 1){
       if (globalB >= 1 && globalB <= 12){
@@ -1079,6 +1156,9 @@ static void onNowRecv(const esp_now_recv_info* info, const uint8_t* data, int le
           // Correct target (order doesn't matter). Turn it off once it's collected.
           if (!(G.hitMask & bit)){
             G.hitMask |= bit;
+
+            // PMS score: count unique correct target presses
+            gPmsScore += 1;
 
             uint8_t nid,lidx;
             if (getDefaultBtnLamp((uint8_t)globalB, nid, lidx)){
@@ -1152,46 +1232,278 @@ static void onNowRecv(const esp_now_recv_info* info, const uint8_t* data, int le
   }
 }
 
+
+// =============================================================
+// PMS standard protocol (!PMS) helpers
+// =============================================================
+
+#if PMS_STD_ENABLED
+
+static int32_t pmsParseKeyInt(const String& line, const char* key, int32_t defaultVal) {
+  String pattern = String(key) + "=";
+  int idx = line.indexOf(pattern);
+  if (idx < 0) return defaultVal;
+
+  idx += pattern.length();
+  int end = idx;
+  while (end < (int)line.length()) {
+    char c = line.charAt(end);
+    if (c == ' ' || c == '\t' || c == '\r' || c == '\n') break;
+    end++;
+  }
+
+  String val = line.substring(idx, end);
+  val.trim();
+  if (val.length() == 0) return defaultVal;
+  return val.toInt();
+}
+
+static String pmsFirstToken(const String& s) {
+  int sp = s.indexOf(' ');
+  if (sp < 0) return s;
+  return s.substring(0, sp);
+}
+
+static String pmsAfterFirstToken(const String& s) {
+  int sp = s.indexOf(' ');
+  if (sp < 0) return "";
+  return s.substring(sp + 1);
+}
+
+// Level -> starting stage (approximate difficulty band)
+//  - Level 1: Easy    (start near len ~4)
+//  - Level 2: Medium  (start near len ~7)
+//  - Level 3: Hard    (start near len ~11)
+static uint16_t pmsStageForLevel(uint8_t level) {
+  switch (level) {
+    case 2: return 3;   // 4 + 3 = 7
+    case 3: return 7;   // 4 + 7 = 11
+    default: return 0;  // 4 + 0 = 4
+  }
+}
+
+static void pmsPrintPong() {
+  PMS_SERIAL.println(F("!PMS PONG v=1 game=mazegates role=server"));
+}
+
+static void pmsPrintEventGameStart(uint8_t level) {
+  PMS_SERIAL.print(F("!PMS EVENT v=1 name=game_start level="));
+  PMS_SERIAL.println(level);
+}
+
+static void pmsPrintEventGameEnd(const char* reason, uint32_t score, uint8_t lives) {
+  PMS_SERIAL.print(F("!PMS EVENT v=1 name=game_end reason="));
+  PMS_SERIAL.print(reason);
+  PMS_SERIAL.print(F(" score="));
+  PMS_SERIAL.print(score);
+  PMS_SERIAL.print(F(" lives="));
+  PMS_SERIAL.println(lives);
+}
+
+static void pmsPrintEventScore(int32_t delta, uint32_t total) {
+  PMS_SERIAL.print(F("!PMS EVENT v=1 name=score delta="));
+  PMS_SERIAL.print(delta);
+  PMS_SERIAL.print(F(" total="));
+  PMS_SERIAL.print(total);
+  PMS_SERIAL.print(F(" bonus="));
+  PMS_SERIAL.println(0); // MazeGates has no bonus scoring in v1
+}
+
+static void pmsPrintEventLife(int32_t delta, uint8_t lives) {
+  PMS_SERIAL.print(F("!PMS EVENT v=1 name=life delta="));
+  PMS_SERIAL.print(delta);
+  PMS_SERIAL.print(F(" lives="));
+  PMS_SERIAL.println(lives);
+}
+
+static void pmsPrintStatus(const char* state, uint8_t level, uint32_t score, uint8_t lives, uint32_t tleftMs, const char* lastReason) {
+  PMS_SERIAL.print(F("!PMS STATUS v=1 state="));
+  PMS_SERIAL.print(state);
+  PMS_SERIAL.print(F(" level="));
+  PMS_SERIAL.print(level);
+  PMS_SERIAL.print(F(" score="));
+  PMS_SERIAL.print(score);
+  PMS_SERIAL.print(F(" lives="));
+  PMS_SERIAL.print(lives);
+  PMS_SERIAL.print(F(" tleft_ms="));
+  PMS_SERIAL.print(tleftMs);
+  PMS_SERIAL.print(F(" last_reason="));
+  PMS_SERIAL.println(lastReason);
+}
+
+static void handlePmsCommand(String line) {
+  line.trim();
+  if (!line.startsWith("!PMS")) return;
+
+  // Strip prefix "!PMS"
+  String rest = line.substring(4);
+  rest.trim();
+  if (rest.length() == 0) return;
+
+  String cmd  = pmsFirstToken(rest);
+  String args = pmsAfterFirstToken(rest);
+  cmd.toUpperCase();
+
+  if (cmd == "PING") {
+    pmsPrintPong();
+    return;
+  }
+
+  if (cmd == "START") {
+    int32_t lvl = pmsParseKeyInt(args, "level", 1);
+    if (lvl < 1) lvl = 1;
+    if (lvl > 3) lvl = 3;
+
+    gPmsLevel   = (uint8_t)lvl;
+    gStartStage = pmsStageForLevel(gPmsLevel);
+
+    // Default duration (server uses 300s when seconds==0)
+    gPmsEndReason = "stopped";
+    gameStart(0);
+    return;
+  }
+
+  if (cmd == "STOP") {
+    gPmsEndReason = "stopped";
+    gameEnd(false);
+    return;
+  }
+
+  // Unknown PMS command: stay silent in production; optional debug log
+  DBG_PRINTF("Unknown PMS cmd: %s\n", line.c_str());
+}
+
+#endif // PMS_STD_ENABLED
+
+// =============================================================
+// PMS STATUS tick + derived EVENTS
+// =============================================================
+
+#if PMS_STD_ENABLED
+
+static uint32_t gPmsLastTickMs  = 0;
+static bool     gPmsInit        = false;
+static bool     gPmsLastActive  = false;
+static bool     gPmsLastPlaying = false;
+static uint32_t gPmsLastScore   = 0;
+static uint8_t  gPmsLastLives   = 0;
+
+static const char* pmsLastReasonStr(bool stateChanged, int32_t scoreDelta, int32_t livesDelta) {
+  if (livesDelta < 0) return "life";
+  if (scoreDelta > 0) return "score";
+  if (stateChanged)   return "state";
+  return "none";
+}
+
+static void pmsTick() {
+  const uint32_t now = millis();
+  if (now - gPmsLastTickMs < (uint32_t)PMS_STATUS_PERIOD_MS) return;
+  gPmsLastTickMs = now;
+
+  const bool active  = (gGameDeadlineMs != 0);
+  const bool playing = (G.st == PLAYING);
+
+  const uint8_t  level   = gPmsLevel;
+  const uint32_t score   = gPmsScore;
+  const uint8_t  lives   = gLivesRemaining;
+
+  uint32_t tleftMs = 0;
+  if (gGameDeadlineMs) {
+    tleftMs = (gGameDeadlineMs > now) ? (gGameDeadlineMs - now) : 0;
+  }
+
+  if (!gPmsInit) {
+    gPmsInit        = true;
+    gPmsLastActive  = active;
+    gPmsLastPlaying = playing;
+    gPmsLastScore   = score;
+    gPmsLastLives   = lives;
+
+    // Do not emit STATUS while idle
+    if (active) {
+      const char* st = playing ? "playing" : "arming";
+      pmsPrintStatus(st, level, score, lives, tleftMs, "none");
+    }
+    return;
+  }
+
+  // game_start / game_end transitions
+  if (!gPmsLastActive && active) {
+    pmsPrintEventGameStart(level);
+  } else if (gPmsLastActive && !active) {
+    // End reason was latched by game logic (timeup/no_lives/stopped)
+    pmsPrintEventGameEnd(gPmsEndReason, score, lives);
+  }
+
+  // While active, emit score/life events and STATUS ticks
+  if (active) {
+    const int32_t scoreDelta = (int32_t)score - (int32_t)gPmsLastScore;
+    const int32_t livesDelta = (int32_t)lives - (int32_t)gPmsLastLives;
+    const bool stateChanged  = (playing != gPmsLastPlaying);
+
+    if (scoreDelta > 0) {
+      pmsPrintEventScore(scoreDelta, score);
+    }
+    if (livesDelta < 0) {
+      pmsPrintEventLife(livesDelta, lives);
+    }
+
+    const char* st = playing ? "playing" : "arming";
+    const char* lastReason = pmsLastReasonStr(stateChanged, scoreDelta, livesDelta);
+    pmsPrintStatus(st, level, score, lives, tleftMs, lastReason);
+  }
+
+  // Update baseline
+  gPmsLastActive  = active;
+  gPmsLastPlaying = playing;
+  gPmsLastScore   = score;
+  gPmsLastLives   = lives;
+}
+
+#else
+static inline void pmsTick() {}
+#endif
+
 // ======= Setup / CLI / Loop =======
 static void printHelp(){
-  Serial.println("Commands:");
-  Serial.println("  help");
-  Serial.println("  hello");
-  Serial.println("  roster");
-  Serial.println("  claim <nodeId> <mac>");
-  Serial.println("  setgate <gateId> <r> <g> <b>");
-  Serial.println("  fakegate <gateId> <enter|exit>");
-  Serial.println("  walkable clear | add <ids> | show");
-  Serial.println("  pushwalkable");
-  Serial.println("  path set <ids>");
-  Serial.println("  btnmap <btn> <nodeId> <lampIdx>   | btnmap show | btnmap clear <btn|all>");
-  Serial.println("  btnlamp <btn> <on|off>            | btnlamptest [ms] | btnlamp echo on|off");
-  Serial.println("  game start [seconds]");
-  Serial.println("  game end");
-  Serial.println("  lamp <nodeId> <idx> <on|off>");
-  Serial.println("  ledmap show [nodeId]");
-  Serial.println("  ledmap get <nodeId> | ledmap get all");
-  Serial.println("  ledmap <nodeId> <pin:count>[,<pin:count>...]");
-  Serial.println("  ota <nodeId> [url]");
-  Serial.println("  ota all [url]");
-  Serial.println("    sample url: http://172.20.10.3:8000/MazeGates/MazeGates_Node/build/esp32.esp32.um_feathers3/MazeGates_Node.ino.bin");
-  Serial.println("  status");
-  Serial.println("  tofvis on|off  (optional: tofvis on <r> <g> <b>)");
-  Serial.println("  tofmap get <nodeId> | tofmap get all");
-  Serial.println("  tofmap set <nodeId> g0,g1,g2,g3,g4,g5,g6,g7");
-  Serial.println("  poc start <seconds>   (B4 target; walkable: 39,28,17,6)");
-  Serial.println("  poc end");
-  Serial.println("  test lengths on|off");
-  Serial.println("  test on | test off");
+  DBG_PRINTLN("Commands:");
+  DBG_PRINTLN("  help");
+  DBG_PRINTLN("  hello");
+  DBG_PRINTLN("  roster");
+  DBG_PRINTLN("  claim <nodeId> <mac>");
+  DBG_PRINTLN("  setgate <gateId> <r> <g> <b>");
+  DBG_PRINTLN("  fakegate <gateId> <enter|exit>");
+  DBG_PRINTLN("  walkable clear | add <ids> | show");
+  DBG_PRINTLN("  pushwalkable");
+  DBG_PRINTLN("  path set <ids>");
+  DBG_PRINTLN("  btnmap <btn> <nodeId> <lampIdx>   | btnmap show | btnmap clear <btn|all>");
+  DBG_PRINTLN("  btnlamp <btn> <on|off>            | btnlamptest [ms] | btnlamp echo on|off");
+  DBG_PRINTLN("  game start [seconds]");
+  DBG_PRINTLN("  game end");
+  DBG_PRINTLN("  lamp <nodeId> <idx> <on|off>");
+  DBG_PRINTLN("  ledmap show [nodeId]");
+  DBG_PRINTLN("  ledmap get <nodeId> | ledmap get all");
+  DBG_PRINTLN("  ledmap <nodeId> <pin:count>[,<pin:count>...]");
+  DBG_PRINTLN("  ota <nodeId> [url]");
+  DBG_PRINTLN("  ota all [url]");
+  DBG_PRINTLN("    sample url: http://172.20.10.3:8000/MazeGates/MazeGates_Node/build/esp32.esp32.um_feathers3/MazeGates_Node.ino.bin");
+  DBG_PRINTLN("  status");
+  DBG_PRINTLN("  tofvis on|off  (optional: tofvis on <r> <g> <b>)");
+  DBG_PRINTLN("  tofmap get <nodeId> | tofmap get all");
+  DBG_PRINTLN("  tofmap set <nodeId> g0,g1,g2,g3,g4,g5,g6,g7");
+  DBG_PRINTLN("  poc start <seconds>   (B4 target; walkable: 39,28,17,6)");
+  DBG_PRINTLN("  poc end");
+  DBG_PRINTLN("  test lengths on|off");
+  DBG_PRINTLN("  test on | test off");
 }
 
 static void printLedMap(int filterNodeId){
-  Serial.println("gate  node  strip  start  count");
+  DBG_PRINTLN("gate  node  strip  start  count");
   for (uint8_t g=1; g<=44; ++g){
     const auto &e = GATE_MAP[g];
     if (!e.nodeId) continue;
     if (filterNodeId>=0 && e.nodeId!=(uint8_t)filterNodeId) continue;
-    Serial.printf("%3u   %3u    %2u    %4u   %4u\n", g, e.nodeId, e.strip, e.start, e.count);
+    DBG_PRINTF("%3u   %3u    %2u    %4u   %4u\n", g, e.nodeId, e.strip, e.start, e.count);
   }
 }
 
@@ -1213,8 +1525,15 @@ void setup(){
 static void handleCli(String s){
   s.trim();
 
-  if (s=="test lengths on"){  gLenSweep = true;  Serial.println("test lengths: ON");  return; }
-  if (s=="test lengths off"){ gLenSweep = false; Serial.println("test lengths: OFF"); return; }
+#if PMS_STD_ENABLED
+  if (s.startsWith("!PMS")) {
+    handlePmsCommand(s);
+    return;
+  }
+#endif
+
+  if (s=="test lengths on"){  gLenSweep = true;  DBG_PRINTLN("test lengths: ON");  return; }
+  if (s=="test lengths off"){ gLenSweep = false; DBG_PRINTLN("test lengths: OFF"); return; }
 
   if (s=="help"){ printHelp(); return; }
   if (s=="hello"){ bcastHelloReq(); return; }
@@ -1222,7 +1541,7 @@ static void handleCli(String s){
   if (s=="roster"){
     for (auto &kv : nodesById){
       auto &n=kv.second;
-      Serial.printf("node %u @ %02X:%02X:%02X:%02X:%02X:%02X\n",
+      DBG_PRINTF("node %u @ %02X:%02X:%02X:%02X:%02X:%02X\n",
                     n.nodeId,n.mac[0],n.mac[1],n.mac[2],n.mac[3],n.mac[4],n.mac[5]);
     }
     return;
@@ -1235,7 +1554,7 @@ static void handleCli(String s){
       if (sscanf(macs,"%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
                  &mac[0],&mac[1],&mac[2],&mac[3],&mac[4],&mac[5])==6){
         sendClaim(mac,(uint8_t)nid); addOrUpdateNode((uint8_t)nid, mac);
-        Serial.println("CLAIM sent");
+        DBG_PRINTLN("CLAIM sent");
       }
     }
     return;
@@ -1247,9 +1566,9 @@ static void handleCli(String s){
       uint8_t nodeId, strip; uint16_t start, count;
       if (routeGate((uint8_t)gid, nodeId, strip, start, count)){
         sendLedRange(nodeId, strip, start, count, (uint8_t)r,(uint8_t)g,(uint8_t)b);
-        Serial.printf("LED_RANGE node=%u strip=%u start=%u count=%u rgb(%d,%d,%d)\n",
+        DBG_PRINTF("LED_RANGE node=%u strip=%u start=%u count=%u rgb(%d,%d,%d)\n",
                       nodeId, strip, start, count, r,g,b);
-      } else Serial.println("Unknown gateId or not mapped.");
+      } else DBG_PRINTLN("Unknown gateId or not mapped.");
     }
     return;
   }
@@ -1259,17 +1578,17 @@ static void handleCli(String s){
     if (sscanf(s.c_str(),"fakegate %d %7s",&gid,kind)==2){
       bool isEnter = (String(kind)=="enter" || String(kind)=="ENTER");
       processGateEvent((uint8_t)gid, isEnter?1:2);
-      Serial.printf("FAKE %s gate %d\n", isEnter?"ENTER":"EXIT", gid);
-    } else Serial.println("usage: fakegate <gateId> <enter|exit>");
+      DBG_PRINTF("FAKE %s gate %d\n", isEnter?"ENTER":"EXIT", gid);
+    } else DBG_PRINTLN("usage: fakegate <gateId> <enter|exit>");
     return;
   }
 
-  if (s=="walkable clear"){ clearWalkable(); Serial.println("walkable cleared"); return; }
+  if (s=="walkable clear"){ clearWalkable(); DBG_PRINTLN("walkable cleared"); return; }
 
   if (s=="walkable show"){
-    Serial.print("walkable: ");
-    for (uint8_t g=1; g<=GATE_MAX; ++g) if (walkable[g]){ Serial.print(g); Serial.print(' '); }
-    Serial.println();
+    DBG_PRINT("walkable: ");
+    for (uint8_t g=1; g<=GATE_MAX; ++g) if (walkable[g]){ DBG_PRINT(g); DBG_PRINT(' '); }
+    DBG_PRINTLN();
     return;
   }
 
@@ -1278,7 +1597,7 @@ static void handleCli(String s){
     char *p = strstr(buf, "add ");
     if (p){ p += 4; char *tok = strtok(p, " ,");
       while (tok){ int gid = atoi(tok); if (gid>=1 && gid<=GATE_MAX) walkable[gid]=true; tok = strtok(NULL, " ,"); }
-      Serial.println("walkable updated");
+      DBG_PRINTLN("walkable updated");
     }
     return;
   }
@@ -1292,7 +1611,7 @@ static void handleCli(String s){
       while (tok){ int gid = atoi(tok); if (gid>=1 && gid<=GATE_MAX) walkable[gid]=true; tok = strtok(NULL, " ,"); }
     }
     pushWalkable();
-    Serial.println("path applied");
+    DBG_PRINTLN("path applied");
     return;
   }
 
@@ -1303,7 +1622,7 @@ static void handleCli(String s){
     if (sscanf(s.c_str(),"lamp %d %d %7s",&nid,&idx,onoff)==3){
       bool on = (String(onoff)=="on");
       sendLampCtrl((uint8_t)nid, (uint8_t)idx, on);
-      Serial.printf("LAMP node=%d idx=%d %s\n", nid, idx, on?"ON":"OFF");
+      DBG_PRINTF("LAMP node=%d idx=%d %s\n", nid, idx, on?"ON":"OFF");
     }
     return;
   }
@@ -1318,20 +1637,20 @@ static void handleCli(String s){
 
     if (s == "ledmap get all"){
       for (auto &kv : nodesById) sendLedMapReq(kv.first);
-      Serial.println("LEDMAP GET sent to all nodes");
+      DBG_PRINTLN("LEDMAP GET sent to all nodes");
       return;
     }
     int getId = -1;
     if (sscanf(s.c_str(),"ledmap get %d", &getId)==1){
       sendLedMapReq((uint8_t)getId);
-      Serial.printf("LEDMAP GET sent to node %d\n", getId);
+      DBG_PRINTF("LEDMAP GET sent to node %d\n", getId);
       return;
     }
 
     int nid = -1; char list[256]={0};
     if (sscanf(s.c_str(),"ledmap %d %255s", &nid, list)==2 && nid>=0){
       auto it = nodesById.find((uint8_t)nid);
-      if (it == nodesById.end()) { Serial.println("Unknown nodeId"); return; }
+      if (it == nodesById.end()) { DBG_PRINTLN("Unknown nodeId"); return; }
 
       LedMapMsg m{}; m.h.type=LED_MAP; m.h.version=PROTO_VER; m.h.nodeId=0; m.h.pad=0; m.h.seq=gSeq++; m.h.len=sizeof(LedMapMsg);
       m.n = 0;
@@ -1347,23 +1666,23 @@ static void handleCli(String s){
         }
         tok = strtok(NULL, ",");
       }
-      if (m.n==0){ Serial.println("usage: ledmap <nodeId> <pin:count>[,<pin:count>...]"); return; }
+      if (m.n==0){ DBG_PRINTLN("usage: ledmap <nodeId> <pin:count>[,<pin:count>...]"); return; }
 
       _enqueueTx(it->second.mac, &m, sizeof(m));
-      Serial.printf("LED_MAP sent to node=%d with %u strips\n", nid, m.n);
+      DBG_PRINTF("LED_MAP sent to node=%d with %u strips\n", nid, m.n);
       return;
     }
 
-    Serial.println("usage: ledmap show [nodeId] | ledmap get <nodeId>|all | ledmap <nodeId> <pin:count>[,<pin:count>...]");
+    DBG_PRINTLN("usage: ledmap show [nodeId] | ledmap get <nodeId>|all | ledmap <nodeId> <pin:count>[,<pin:count>...]");
     return;
   }
 
   // tofmap get
   if (s.startsWith("tofmap get")){
     int nid=-1;
-    if (s=="tofmap get all"){ for (auto &kv : nodesById) sendTofMapReq(kv.first); Serial.println("TOFMAP GET sent to all"); return; }
-    if (sscanf(s.c_str(),"tofmap get %d",&nid)==1){ sendTofMapReq((uint8_t)nid); Serial.printf("TOFMAP GET sent to node %d\n", nid); }
-    else Serial.println("usage: tofmap get <nodeId>|all");
+    if (s=="tofmap get all"){ for (auto &kv : nodesById) sendTofMapReq(kv.first); DBG_PRINTLN("TOFMAP GET sent to all"); return; }
+    if (sscanf(s.c_str(),"tofmap get %d",&nid)==1){ sendTofMapReq((uint8_t)nid); DBG_PRINTF("TOFMAP GET sent to node %d\n", nid); }
+    else DBG_PRINTLN("usage: tofmap get <nodeId>|all");
     return;
   }
 
@@ -1375,10 +1694,10 @@ static void handleCli(String s){
       char buf[128]; strncpy(buf,list,sizeof(buf)-1); buf[sizeof(buf)-1]=0;
       char *tok = strtok(buf, ","); int i=0;
       while (tok && i<8){ int v=atoi(tok); if (v<0) v=0; if (v>255) v=255; g[i++]=(uint8_t)v; tok = strtok(NULL,","); }
-      if (i!=8){ Serial.println("usage: tofmap set <nodeId> g0,g1,g2,g3,g4,g5,g6,g7"); return; }
+      if (i!=8){ DBG_PRINTLN("usage: tofmap set <nodeId> g0,g1,g2,g3,g4,g5,g6,g7"); return; }
       sendTofMapSet((uint8_t)nid, g);
-      Serial.printf("TOFMAP set node=%d [%u,%u,%u,%u,%u,%u,%u,%u]\n", nid,g[0],g[1],g[2],g[3],g[4],g[5],g[6],g[7]);
-    } else Serial.println("usage: tofmap set <nodeId> g0,g1,g2,g3,g4,g5,g6,g7");
+      DBG_PRINTF("TOFMAP set node=%d [%u,%u,%u,%u,%u,%u,%u,%u]\n", nid,g[0],g[1],g[2],g[3],g[4],g[5],g[6],g[7]);
+    } else DBG_PRINTLN("usage: tofmap set <nodeId> g0,g1,g2,g3,g4,g5,g6,g7");
     return;
   }
 
@@ -1389,19 +1708,19 @@ static void handleCli(String s){
       for (auto &kv : nodesById){
         auto nid = kv.first;
         sendOtaStart(nid, (n==1)?String(url):String());
-        Serial.printf("OTA_START node=%u %s\n", nid, (n==1)?url:"<default>");
+        DBG_PRINTF("OTA_START node=%u %s\n", nid, (n==1)?url:"<default>");
       }
       return;
     }
     int nid; char url[256]={0}; int n=sscanf(s.c_str(),"ota %d %255s",&nid,url);
     sendOtaStart((uint8_t)nid, (n==2)?String(url):String());
-    Serial.printf("OTA_START node=%d %s\n", nid, (n==2)?url:"<default>");
+    DBG_PRINTF("OTA_START node=%d %s\n", nid, (n==2)?url:"<default>");
     return;
   }
 
   if (s=="status"){
     bcastHelloReq();
-    Serial.println("node  uptime(s)  inited  maxErr  reinitCounts                 lastUpdate(s ago)");
+    DBG_PRINTLN("node  uptime(s)  inited  maxErr  reinitCounts                 lastUpdate(s ago)");
     for (auto &kv : lastStatus) {
       auto nid = kv.first; const auto &st = kv.second;
       uint32_t nowMs = millis();
@@ -1412,13 +1731,13 @@ static void handleCli(String s){
         ageSec = (int32_t)(ageMs / 1000UL);
       }
 
-      Serial.printf("%3u  %9lu   0x%02X     %3u   [",
+      DBG_PRINTF("%3u  %9lu   0x%02X     %3u   [",
                     nid, (unsigned)(st.uptimeMs/1000), st.initedMask, st.errStreakMax);
-      for (int i=0;i<8;i++) { Serial.printf("%u%s", st.reinitCount[i], i==7?"]   ":" ,"); }
+      for (int i=0;i<8;i++) { DBG_PRINTF("%u%s", st.reinitCount[i], i==7?"]   ":" ,"); }
 
-      if (ageSec >= 0) Serial.printf("%6d", ageSec);
-      else             Serial.printf("     -");
-      Serial.println();
+      if (ageSec >= 0) DBG_PRINTF("%6d", ageSec);
+      else             DBG_PRINTF("     -");
+      DBG_PRINTLN();
     }
     return;
   }
@@ -1428,30 +1747,30 @@ static void handleCli(String s){
     s.replace("\r",""); s.replace("\n",""); s.trim();
 
     if (s=="btnmap show"){
-      Serial.println("BTN  node  lampIdx");
+      DBG_PRINTLN("BTN  node  lampIdx");
       for (int b=1;b<=12;b++){
-        if (BTNMAP[b].valid) Serial.printf("%-3d %-5u %u\n", b, BTNMAP[b].nodeId, BTNMAP[b].lampIdx);
+        if (BTNMAP[b].valid) DBG_PRINTF("%-3d %-5u %u\n", b, BTNMAP[b].nodeId, BTNMAP[b].lampIdx);
       }
       return;
     }
     if (s=="btnmap clear all"){
       for (int b=1;b<=12;b++) BTNMAP[b].valid=false;
-      Serial.println("BTNMAP cleared");
+      DBG_PRINTLN("BTNMAP cleared");
       return;
     }
     int btn=-1;
     if (sscanf(s.c_str(),"btnmap clear %d",&btn)==1 && btn>=1 && btn<=12){
       BTNMAP[btn].valid=false;
-      Serial.printf("BTNMAP: Btn%d cleared\n", btn);
+      DBG_PRINTF("BTNMAP: Btn%d cleared\n", btn);
       return;
     }
     int nid=-1,lidx=-1;
     if (sscanf(s.c_str(),"btnmap %d %d %d",&btn,&nid,&lidx)==3 && btn>=1 && btn<=12){
       BTNMAP[btn] = { (uint8_t)nid, (uint8_t)lidx, true };
-      Serial.printf("BTNMAP: Btn%d -> node=%d lampIdx=%d\n", btn, nid, lidx);
+      DBG_PRINTF("BTNMAP: Btn%d -> node=%d lampIdx=%d\n", btn, nid, lidx);
       return;
     }
-    Serial.println("usage: btnmap <btn 1..12> <nodeId> <lampIdx 1..3> | btnmap show | btnmap clear <btn|all>");
+    DBG_PRINTLN("usage: btnmap <btn 1..12> <nodeId> <lampIdx 1..3> | btnmap show | btnmap clear <btn|all>");
     return;
   }
 
@@ -1460,8 +1779,8 @@ static void handleCli(String s){
     char onoff[8]={0};
     if (sscanf(s.c_str(),"btnlamp echo %7s", onoff)==1){
       gBtnEcho = (String(onoff)=="on");
-      Serial.printf("btnlamp echo: %s\n", gBtnEcho?"ON":"OFF");
-    } else Serial.println("usage: btnlamp echo on|off");
+      DBG_PRINTF("btnlamp echo: %s\n", gBtnEcho?"ON":"OFF");
+    } else DBG_PRINTLN("usage: btnlamp echo on|off");
     return;
   }
 
@@ -1473,9 +1792,9 @@ static void handleCli(String s){
       if (getDefaultBtnLamp((uint8_t)btn, nid, lidx)){
         bool on = (String(onoff)=="on");
         sendLampCtrl(nid, lidx, on);
-        Serial.printf("btnlamp Btn%d %s\n", btn, on?"ON":"OFF");
-      } else Serial.println("btnlamp: no default mapping for that button");
-    } else Serial.println("usage: btnlamp <btn 1..12> <on|off>");
+        DBG_PRINTF("btnlamp Btn%d %s\n", btn, on?"ON":"OFF");
+      } else DBG_PRINTLN("btnlamp: no default mapping for that button");
+    } else DBG_PRINTLN("usage: btnlamp <btn 1..12> <on|off>");
     return;
   }
 
@@ -1488,7 +1807,7 @@ static void handleCli(String s){
       sendLampCtrl(nid, lidx, true);  delay(ms);
       sendLampCtrl(nid, lidx, false); delay(50);
     }
-    Serial.println("btnlamptest done");
+    DBG_PRINTLN("btnlamptest done");
     return;
   }
 
@@ -1508,15 +1827,15 @@ static void handleCli(String s){
       char buf[64]; strncpy(buf,list,sizeof(buf)-1); buf[sizeof(buf)-1]=0;
       char *tok = strtok(buf, ",");
       while (tok && n<3){ int p=atoi(tok); if (p>0){ pins[n++]=(uint8_t)p; } tok=strtok(NULL,","); }
-      if (n==0){ Serial.println("usage: btnpins set <nodeId> <pin[,pin[,pin]]>"); return; }
+      if (n==0){ DBG_PRINTLN("usage: btnpins set <nodeId> <pin[,pin[,pin]]>"); return; }
       sendBtnPinsSet((uint8_t)nid, pins, n);
-      Serial.printf("BTNPINS set node=%d n=%u\n", nid, n);
-    } else Serial.println("usage: btnpins set <nodeId> <pin[,pin[,pin]]>");
+      DBG_PRINTF("BTNPINS set node=%d n=%u\n", nid, n);
+    } else DBG_PRINTLN("usage: btnpins set <nodeId> <pin[,pin[,pin]]>");
     return;
   }
   if (s.startsWith("btnpins get ")){
     int nid; if (sscanf(s.c_str(),"btnpins get %d",&nid)==1){ sendBtnPinsReq((uint8_t)nid); }
-    else Serial.println("usage: btnpins get <nodeId>");
+    else DBG_PRINTLN("usage: btnpins get <nodeId>");
     return;
   }
 
@@ -1526,25 +1845,25 @@ static void handleCli(String s){
     if (s=="tofvis on"){
       gTofVis=true;
       sendGameStateBroadcast(W_PLAYING, 0,0,0); // nodes sense during tofvis
-      Serial.println("ToF visualization: ON (blue) [nodes set to PLAYING]");
+      DBG_PRINTLN("ToF visualization: ON (blue) [nodes set to PLAYING]");
       return;
     }
-    if (s=="tofvis off"){ gTofVis=false; Serial.println("ToF visualization: OFF"); return; }
+    if (s=="tofvis off"){ gTofVis=false; DBG_PRINTLN("ToF visualization: OFF"); return; }
     if (sscanf(s.c_str(),"tofvis on %d %d %d",&r,&g,&b)==3){
       if (r<0) r=0; if (r>255) r=255;
       if (g<0) g=0; if (g>255) g=255;
       if (b<0) b=0; if (b>255) b=255;
       gTofR=(uint8_t)r; gTofG=(uint8_t)g; gTofB=(uint8_t)b; gTofVis=true;
       sendGameStateBroadcast(W_PLAYING, 0,0,0);
-      Serial.printf("ToF visualization: ON rgb(%d,%d,%d) [nodes set to PLAYING]\n", r,g,b);
+      DBG_PRINTF("ToF visualization: ON rgb(%d,%d,%d) [nodes set to PLAYING]\n", r,g,b);
       return;
     }
-    Serial.println("usage: tofvis on|off  OR  tofvis on <r> <g> <b>");
+    DBG_PRINTLN("usage: tofvis on|off  OR  tofvis on <r> <g> <b>");
     return;
   }
 
   // game end
-  if (s=="game end"){ gameEnd(false); return; }
+  if (s=="game end"){ gPmsEndReason = "stopped"; gameEnd(false); return; }
 
   // ---- POC: start/end using RoundCfg (nodes paint locally) ----
   if (s.startsWith("poc start")){
@@ -1573,13 +1892,14 @@ static void handleCli(String s){
 
     sendRoundCfg(targets, 1, walkBits);
 
-    Serial.printf("[POC] START epoch=%u sec=%d target=B4 path=39,28,17,6\n", gEpoch, secs);
+    DBG_PRINTF("[POC] START epoch=%u sec=%d target=B4 path=39,28,17,6\n", gEpoch, secs);
     return;
   }
 
   if (s == "poc end"){
+    gPmsEndReason = "stopped";
     gameEnd(false);
-    Serial.println("[POC] END");
+    DBG_PRINTLN("[POC] END");
     return;
   }
 
@@ -1588,7 +1908,7 @@ static void handleCli(String s){
     gBtnEcho  = true;   // convenience: lamp pulses on press
     gTofVis   = true;   // convenience: enable segment paint
     sendGameStateBroadcast(W_PLAYING, 0,0,0);  // nodes start sensing (node PLAYING)
-    Serial.println("[TEST] ON: nodes PLAYING; epoch bypass for TOF (and buttons via echo)");
+    DBG_PRINTLN("[TEST] ON: nodes PLAYING; epoch bypass for TOF (and buttons via echo)");
     return;
   }
 
@@ -1597,12 +1917,12 @@ static void handleCli(String s){
     gBtnEcho  = false;
     gTofVis   = false;
     sendGameStateBroadcast(W_IDLE, 0,0,0);     // nodes stop sensing
-    Serial.println("[TEST] OFF");
+    DBG_PRINTLN("[TEST] OFF");
     return;
   }
 
   if (s=="") return;
-  Serial.println("Unknown command. Type: help");
+  DBG_PRINTLN("Unknown command. Type: help");
 }
 
 void loop(){
@@ -1629,7 +1949,7 @@ void loop(){
     gFailBlinkNext = 0;
     gFailBlinkOn   = false;  // first toggle => ON (red / lamp on)
 
-    Serial.printf("[LIFE] Feedback: culprit gate=%u btn=%u (%lums)\n",
+    DBG_PRINTF("[LIFE] Feedback: culprit gate=%u btn=%u (%lums)\n",
                   gFailGate, gFailBtn, (unsigned long)kLifeFeedbackMs);
   }
 
@@ -1649,7 +1969,7 @@ void loop(){
     setAllLamps(false);
 
     gSuccessFeedbackUntil = millis() + kSuccessFeedbackMs;
-    Serial.printf("[MAZE] SUCCESS feedback (%lums)\n", (unsigned long)kSuccessFeedbackMs);
+    DBG_PRINTF("[MAZE] SUCCESS feedback (%lums)\n", (unsigned long)kSuccessFeedbackMs);
   }
 
   // Feedback finished -> intermission (all-gates white blink), then restart same difficulty
@@ -1699,6 +2019,7 @@ void loop(){
 
   // Game hard timer -> win
   if (gGameDeadlineMs && (int32_t)(millis() - gGameDeadlineMs) >= 0){
+    gPmsEndReason = "timeup";
     gGameDeadlineMs = 0; scheduleGameEnd(true);
   }
 
@@ -1716,6 +2037,9 @@ void loop(){
 
   dripPump();
   flushLogs();
+
+  // PMS tick (STATUS + EVENTS)
+  pmsTick();
 
   // Auto-off for echo pulses
   uint32_t nowMs = millis();
