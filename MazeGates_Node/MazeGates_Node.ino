@@ -18,12 +18,44 @@
 #include "vl53l4cx_class.h"   // STM32duino VL53L4CX by ST
 
 #include "MazeGates_Map.h"
+// =============================================================
+// MazeGates radio + wire framing (anti cross-game interference)
+// =============================================================
+//
+// All ESP-NOW payloads are prefixed with 3 bytes:
+//   'M' 'Z' 1
+//
+// Receivers drop any packet without this prefix.
+// This prevents other games on the same channel from being mis-parsed as MazeGates.
+//
+// Note: ESPNOW payload limit is 250 bytes. Our largest packet (OTA_START) stays below that.
+
+static constexpr uint8_t MAZEGATES_CHANNEL  = 6;
+
+static constexpr uint8_t MG_WIRE_MAGIC0    = 'M';
+static constexpr uint8_t MG_WIRE_MAGIC1    = 'Z';
+static constexpr uint8_t MG_WIRE_VERSION   = 1;
+static constexpr size_t  MG_WIRE_HDR_LEN   = 3;
+static constexpr size_t  MG_WIRE_MAX_PACKET = 250;
+
+// NOTE (Arduino build quirk): keep this as a macro (not a function).
+// The Arduino sketch preprocessor may auto-generate function prototypes at the
+// top of the file; if we define helper functions before our struct/type
+// declarations, those prototypes can end up before the type definitions and
+// trigger "does not name a type" compile errors.
+#define mgWireOk(data, len) ( \
+  ((len) >= (int)MG_WIRE_HDR_LEN) && \
+  ((data)[0] == MG_WIRE_MAGIC0) && \
+  ((data)[1] == MG_WIRE_MAGIC1) && \
+  ((data)[2] == MG_WIRE_VERSION) \
+)
+
 
 // ---------- OTA defaults ----------
 #ifndef OTA_SSID
 #define OTA_SSID "AndrewiPhone"
 #define OTA_PASS "12345678"
-#define OTA_BASE_URL "http://192.168.2.231:8000/"
+#define OTA_BASE_URL "http://172.20.10.3:8000/"
 #define OTA_NODE_PATH "MazeGates/MazeGates_Node/build/esp32.esp32.um_feathers3/MazeGates_Node.ino.bin"
 #endif
 
@@ -307,23 +339,26 @@ static uint8_t kBroadcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 
 // ----- Tiny non-blocking TX queue for ESP-NOW -----
 #define TXQ_SIZE 16
-struct TxFrame { uint8_t len; uint8_t buf[64]; };
+struct TxFrame { uint8_t mac[6]; uint8_t len; uint8_t buf[128]; };
 static TxFrame txq[TXQ_SIZE];
 static volatile uint8_t txHead = 0, txTail = 0;
 
-static inline bool enqueueTx(const void* data, uint8_t len){
+static inline bool enqueueTx(const uint8_t* mac, const void* data, uint8_t len){
   uint8_t nhead = (uint8_t)((txHead + 1) % TXQ_SIZE);
   if (nhead == txTail) return false;        // full -> drop (or count drops)
-  if (len > sizeof(txq[0].buf)) len = sizeof(txq[0].buf);
+
+  if (len > sizeof(txq[0].buf)) return false;
+  memcpy(txq[txHead].mac, mac, 6);
   memcpy(txq[txHead].buf, data, len);
   txq[txHead].len = len;
   txHead = nhead;
   return true;
+
 }
 static void pumpTx(){
   while (txTail != txHead){
     TxFrame &f = txq[txTail];
-    esp_err_t r = esp_now_send(kBroadcast, f.buf, f.len);
+    esp_err_t r = esp_now_send(f.mac, f.buf, f.len);
     if (r == ESP_OK) txTail = (uint8_t)((txTail + 1) % TXQ_SIZE);
     else break; // try again next loop tick
   }
@@ -333,8 +368,18 @@ static void onNowSent(const wifi_tx_info_t* info, esp_now_send_status_t status) 
 }
 
 static void sendRaw(const uint8_t* mac, const uint8_t* data, size_t len){
-  if (esp_now_send(mac, data, len) == ESP_OK) return;
-  enqueueTx(data, (uint8_t)((len > 64) ? 64 : len));
+  // Frame the payload with MazeGates wire header (magic + wire version).
+  const size_t outLen = len + MG_WIRE_HDR_LEN;
+  if (outLen > MG_WIRE_MAX_PACKET) return;   // safety: ESPNOW max payload is 250 bytes
+
+  uint8_t buf[MG_WIRE_MAX_PACKET];
+  buf[0] = MG_WIRE_MAGIC0;
+  buf[1] = MG_WIRE_MAGIC1;
+  buf[2] = MG_WIRE_VERSION;
+  memcpy(buf + MG_WIRE_HDR_LEN, data, len);
+
+  if (esp_now_send(mac, buf, outLen) == ESP_OK) return;
+  enqueueTx(mac, buf, (uint8_t)outLen);
 }
 
 static void sendHello(){ HelloMsg m{}; m.h={HELLO,PROTO_VER,gNodeId,0,gSeq++,sizeof(HelloMsg)}; m.role=1; m.caps=0; sendRaw(kBroadcast,(uint8_t*)&m,sizeof(m)); }
@@ -418,7 +463,14 @@ static const uint32_t LED_MIN_INTERVAL_MS = 40;  // ~25 fps max, tweakable
 
 // ---------- ESP-NOW RX ----------
 static void onNowRecv(const esp_now_recv_info* info, const uint8_t* data, int len){
-  if (!info || len < (int)sizeof(PktHeader)) return; auto *h=(const PktHeader*)data;
+  if (!info || len < (int)(MG_WIRE_HDR_LEN + sizeof(PktHeader))) return;
+  if (!mgWireOk(data, len)) return;
+
+  // Shift to protocol payload (after wire header)
+  data += MG_WIRE_HDR_LEN;
+  len  -= MG_WIRE_HDR_LEN;
+
+  auto *h=(const PktHeader*)data;
   if (h->version!=PROTO_VER) return;
 
   if (h->type == GAME_STATE && len >= (int)sizeof(GameStateMsg)){
@@ -685,7 +737,7 @@ static void i2cBusRecover(uint8_t sda=PIN_SDA, uint8_t scl=PIN_SCL){
 
 // ---------- ESP-NOW/OTA helpers ----------
 static void stopEspNow(){ esp_now_deinit(); }
-static esp_err_t startEspNow(){ if (esp_now_init()!=ESP_OK) return ESP_FAIL; esp_now_register_recv_cb(onNowRecv); esp_now_peer_info_t p{}; memcpy(p.peer_addr,kBroadcast,6); p.channel=6; p.encrypt=false; p.ifidx=WIFI_IF_STA; esp_now_add_peer(&p); return ESP_OK; }
+static esp_err_t startEspNow(){ if (esp_now_init()!=ESP_OK) return ESP_FAIL; esp_now_register_recv_cb(onNowRecv); esp_now_peer_info_t p{}; memcpy(p.peer_addr,kBroadcast,6); p.channel=MAZEGATES_CHANNEL; p.encrypt=false; p.ifidx=WIFI_IF_STA; esp_now_add_peer(&p); return ESP_OK; }
 static bool connectWifiSta(const String& ssid, const String& pass, uint32_t timeoutMs=15000){ WiFi.disconnect(true); WiFi.mode(WIFI_STA); WiFi.begin(ssid.c_str(), pass.c_str()); uint32_t t0=millis(); while (WiFi.status()!=WL_CONNECTED && (millis()-t0)<timeoutMs) delay(100); return WiFi.status()==WL_CONNECTED; }
 static void performHttpOta(String url, String ssid, String pass){
   gOtaMode = true;
@@ -695,7 +747,7 @@ static void performHttpOta(String url, String ssid, String pass){
   if (url.length()==0)  url  = String(OTA_BASE_URL) + OTA_NODE_PATH;
   if (!connectWifiSta(ssid, pass)){
     Serial.println("[OTA] WiFi connect failed"); showOtaError();
-    esp_wifi_set_channel(6, WIFI_SECOND_CHAN_NONE); startEspNow(); return;
+    esp_wifi_set_channel(MAZEGATES_CHANNEL, WIFI_SECOND_CHAN_NONE); startEspNow(); return;
   }
   Serial.printf("[OTA] Connected %s IP=%s\n", ssid.c_str(), WiFi.localIP().toString().c_str());
   Update.onProgress([](size_t d,size_t t){ drawOtaProgress(d,t); });
@@ -703,7 +755,7 @@ static void performHttpOta(String url, String ssid, String pass){
   Serial.printf("[OTA] GET %s\n", url.c_str());
   t_httpUpdate_return r = httpUpdate.update(client, url);
   if (r==HTTP_UPDATE_OK){ Serial.println("[OTA] OK, rebooting"); showOtaSuccess(); delay(400); forceTofColdState(); ESP.restart(); }
-  else { Serial.printf("[OTA] Fail code=%d\n", (int)r); Serial.printf("[OTA] Error: %s\n", httpUpdate.getLastErrorString().c_str()); showOtaError(); esp_wifi_set_channel(6, WIFI_SECOND_CHAN_NONE); startEspNow(); gOtaMode = false; }
+  else { Serial.printf("[OTA] Fail code=%d\n", (int)r); Serial.printf("[OTA] Error: %s\n", httpUpdate.getLastErrorString().c_str()); showOtaError(); esp_wifi_set_channel(MAZEGATES_CHANNEL, WIFI_SECOND_CHAN_NONE); startEspNow(); gOtaMode = false; }
 }
 
 // ---------- TCA9548A ----------
@@ -955,12 +1007,12 @@ void setup(){
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
 
-  esp_wifi_set_channel(6, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_channel(MAZEGATES_CHANNEL, WIFI_SECOND_CHAN_NONE);
   if (esp_now_init()==ESP_OK){
     esp_now_register_send_cb(onNowSent);
     esp_now_register_recv_cb(onNowRecv);
     esp_now_peer_info_t p{}; memcpy(p.peer_addr,kBroadcast,6);
-    p.channel=6; p.encrypt=false; p.ifidx=WIFI_IF_STA; esp_now_add_peer(&p);
+    p.channel=MAZEGATES_CHANNEL; p.encrypt=false; p.ifidx=WIFI_IF_STA; esp_now_add_peer(&p);
   }
 
   prefs.begin("maze", false); gNodeId = prefs.getUChar("nodeId", 4); prefs.end();

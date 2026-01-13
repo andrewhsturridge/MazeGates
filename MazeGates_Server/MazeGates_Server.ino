@@ -44,6 +44,38 @@
 #include <stdarg.h>
 
 #include "MazeGates_Map.h"   // shared: GATE_MAP and BTN_DEFAULT
+// =============================================================
+// MazeGates radio + wire framing (anti cross-game interference)
+// =============================================================
+//
+// All ESP-NOW payloads are prefixed with 3 bytes:
+//   'M' 'Z' 1
+//
+// Receivers drop any packet without this prefix.
+// This prevents other games on the same channel from being mis-parsed as MazeGates.
+//
+// Note: ESPNOW payload limit is 250 bytes. Our largest packet (OTA_START) stays below that.
+
+static constexpr uint8_t MAZEGATES_CHANNEL  = 6;
+
+static constexpr uint8_t MG_WIRE_MAGIC0    = 'M';
+static constexpr uint8_t MG_WIRE_MAGIC1    = 'Z';
+static constexpr uint8_t MG_WIRE_VERSION   = 1;
+static constexpr size_t  MG_WIRE_HDR_LEN   = 3;
+static constexpr size_t  MG_WIRE_MAX_PACKET = 250;
+
+// NOTE (Arduino build quirk): keep this as a macro (not a function).
+// The Arduino sketch preprocessor may auto-generate function prototypes at the
+// top of the file; if we define helper functions before our struct/type
+// declarations, those prototypes can end up before the type definitions and
+// trigger "does not name a type" compile errors.
+#define mgWireOk(data, len) ( \
+  ((len) >= (int)MG_WIRE_HDR_LEN) && \
+  ((data)[0] == MG_WIRE_MAGIC0) && \
+  ((data)[1] == MG_WIRE_MAGIC1) && \
+  ((data)[2] == MG_WIRE_VERSION) \
+)
+
 
 
 // =============================================================
@@ -288,14 +320,26 @@ static String macToStr(const uint8_t m[6]){
 }
 static void addOrUpdateNode(uint8_t nodeId, const uint8_t mac[6]){
   NodeInfo n{nodeId,{0}}; memcpy(n.mac,mac,6); nodesById[nodeId]=n;
-  esp_now_peer_info_t p{}; memcpy(p.peer_addr,mac,6); p.channel=6; p.encrypt=false; p.ifidx = WIFI_IF_STA; esp_now_add_peer(&p);
+  esp_now_peer_info_t p{}; memcpy(p.peer_addr,mac,6); p.channel=MAZEGATES_CHANNEL; p.encrypt=false; p.ifidx = WIFI_IF_STA; esp_now_add_peer(&p);
 }
-static void sendRaw(const uint8_t mac[6], const uint8_t* data, size_t len){ esp_now_send(mac, data, len); }
+static void sendRaw(const uint8_t mac[6], const uint8_t* data, size_t len){
+  // Frame the payload with MazeGates wire header (magic + wire version).
+  const size_t outLen = len + MG_WIRE_HDR_LEN;
+  if (outLen > MG_WIRE_MAX_PACKET) return;   // safety: ESPNOW max payload is 250 bytes
+
+  uint8_t buf[MG_WIRE_MAX_PACKET];
+  buf[0] = MG_WIRE_MAGIC0;
+  buf[1] = MG_WIRE_MAGIC1;
+  buf[2] = MG_WIRE_VERSION;
+  memcpy(buf + MG_WIRE_HDR_LEN, data, len);
+
+  esp_now_send(mac, buf, outLen);
+}
 static void bcastHelloReq(){ HelloMsg m{}; m.h={HELLO_REQ,PROTO_VER,0,0,gSeq++,sizeof(HelloMsg)}; m.role=0; m.caps=0; sendRaw(kBroadcast,(uint8_t*)&m,sizeof(m)); }
 static void sendClaim(const uint8_t mac[6], uint8_t nodeId){ ClaimMsg m{}; m.h={CLAIM,PROTO_VER,0,0,gSeq++,sizeof(ClaimMsg)}; m.newNodeId=nodeId; sendRaw(mac,(uint8_t*)&m,sizeof(m)); }
 
 // ======= Drip TX queue =======
-struct TxItem { uint8_t mac[6]; uint8_t len; uint8_t buf[64]; };
+struct TxItem { uint8_t mac[6]; uint8_t len; uint8_t buf[128]; };
 static TxItem txQ[64];
 static volatile uint8_t qHead = 0, qTail = 0;
 static uint32_t lastTxMs = 0;
@@ -304,9 +348,19 @@ static const uint16_t DRIP_MS = 5;
 static void _enqueueTx(const uint8_t mac[6], const void* data, uint8_t len){
   uint8_t next = (uint8_t)((qTail + 1) & 63);
   if (next == qHead) qHead = (uint8_t)((qHead + 1) & 63); // drop oldest
+
+  // Frame the payload into the queue buffer.
+  const uint16_t outLen = (uint16_t)len + (uint16_t)MG_WIRE_HDR_LEN;
+  if (outLen > sizeof(txQ[qTail].buf)) return;
+
   memcpy(txQ[qTail].mac, mac, 6);
-  txQ[qTail].len = len;
-  memcpy(txQ[qTail].buf, data, len);
+  txQ[qTail].len = (uint8_t)outLen;
+
+  txQ[qTail].buf[0] = MG_WIRE_MAGIC0;
+  txQ[qTail].buf[1] = MG_WIRE_MAGIC1;
+  txQ[qTail].buf[2] = MG_WIRE_VERSION;
+  memcpy(txQ[qTail].buf + MG_WIRE_HDR_LEN, data, len);
+
   qTail = next;
 }
 static void dripPump(){
@@ -1098,9 +1152,16 @@ static void printTofMap(uint8_t nodeId, const TofMapRsp* r){
 }
 
 static void onNowRecv(const esp_now_recv_info* info, const uint8_t* data, int len){
-  if (!info || len < (int)sizeof(PktHeader)) return;
-  auto *h=(const PktHeader*)data; if (h->version!=PROTO_VER) return;
-  const uint8_t* mac = info->src_addr;
+  if (!info || len < (int)(MG_WIRE_HDR_LEN + sizeof(PktHeader))) return;
+  if (!mgWireOk(data, len)) return;
+
+  // Shift to protocol payload (after wire header)
+  data += MG_WIRE_HDR_LEN;
+  len  -= MG_WIRE_HDR_LEN;
+
+  auto *h=(const PktHeader*)data;
+  if (h->version!=PROTO_VER) return;
+const uint8_t* mac = info->src_addr;
 
   // Auto-learn any node that talks to us (not just HELLO), so unicast LED_RANGE/LAMP_CTRL
   // always works even if a node missed HELLO_REQ at boot.
@@ -1510,12 +1571,12 @@ static void printLedMap(int filterNodeId){
 void setup(){
   Serial.begin(115200);
   WiFi.mode(WIFI_STA);
-  esp_wifi_set_channel(6, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_channel(MAZEGATES_CHANNEL, WIFI_SECOND_CHAN_NONE);
   esp_now_init();
   esp_now_register_recv_cb(onNowRecv);
 
   esp_now_peer_info_t p{}; memcpy(p.peer_addr,kBroadcast,6);
-  p.channel=6; p.encrypt=false; p.ifidx = WIFI_IF_STA; esp_now_add_peer(&p);
+  p.channel=MAZEGATES_CHANNEL; p.encrypt=false; p.ifidx = WIFI_IF_STA; esp_now_add_peer(&p);
 
   delay(200);
   bcastHelloReq();

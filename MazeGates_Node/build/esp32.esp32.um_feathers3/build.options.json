@@ -1,0 +1,10 @@
+{
+  "additionalFiles": "../..",
+  "builtInLibrariesFolders": "/Users/andrewhsturridge/Library/Arduino15/libraries",
+  "compiler.optimization_flags": "-Os",
+  "customBuildProperties": "",
+  "fqbn": "esp32:esp32:um_feathers3:UploadSpeed=921600,USBMode=hwcdc,CDCOnBoot=cdc,MSCOnBoot=default,DFUOnBoot=default,UploadMode=cdc,CPUFreq=240,FlashMode=qio,PartitionScheme=default_16MB,DebugLevel=none,PSRAM=enabled,LoopCore=1,EventsCore=1,EraseFlash=none",
+  "hardwareFolders": "/Users/andrewhsturridge/Library/Arduino15/packages",
+  "otherLibrariesFolders": "/Users/andrewhsturridge/Documents/Arduino/libraries",
+  "sketchLocation": "/Users/andrewhsturridge/Documents/Arduino/MazeGates/MazeGates_Node"
+}
