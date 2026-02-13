@@ -168,6 +168,17 @@ static const uint32_t kLifeFeedbackMs  = 4000;   // 10 toggles @ 400ms ≈ 5 red
 // Per-maze success flash (green) before intermission blink
 static const uint32_t kSuccessFeedbackMs = 1200;
 
+
+// Game-over (NO_LIVES) blink sequence:
+// When the last life is lost, blink the whole room red a few times, then turn OFF.
+// This is server-driven (GAME_STATE toggles), so nodes require no special support.
+static const uint8_t  kNoLivesBlinkFlashes  = 4;      // "a few times"
+static const uint32_t kNoLivesBlinkToggleMs = 300;    // on/off toggle period
+static bool     gNoLivesBlinkActive      = false;
+static bool     gNoLivesBlinkOn          = false;
+static uint8_t  gNoLivesBlinkTogglesLeft = 0;        // remaining on/off toggles
+static uint32_t gNoLivesBlinkNextMs      = 0;        // next toggle time
+
 static uint8_t gLivesRemaining = kStartLives;    // reset on gameStart()
 static bool    gRetrySameRound  = false;         // consumed after intermission
 
@@ -778,6 +789,55 @@ static void tickFailFlash(){
   }
 }
 
+
+// ======= Game-over NO_LIVES red-blink sequence =======
+//
+// We only run this when the session ends due to lives reaching 0.
+// The server toggles GAME_STATE between red and off; nodes just paint the overlay.
+//
+static void startNoLivesBlink(){
+  gNoLivesBlinkActive = true;
+  gNoLivesBlinkOn = true;
+  gNoLivesBlinkTogglesLeft = (uint8_t)(kNoLivesBlinkFlashes * 2 - 1); // start ON, end OFF
+  gNoLivesBlinkNextMs = millis() + kNoLivesBlinkToggleMs;
+
+  // Start with red ON (use default repeats for reliability)
+  sendGameStateToAll(W_OVER, 150, 0, 0);
+  setAllLamps(true);
+}
+
+static void stopNoLivesBlinkOff(){
+  gNoLivesBlinkActive = false;
+  gNoLivesBlinkOn = false;
+  gNoLivesBlinkTogglesLeft = 0;
+  gNoLivesBlinkNextMs = 0;
+
+  // Ensure we end OFF
+  sendGameStateToAll(W_OVER, 0, 0, 0);
+  setAllLamps(false);
+}
+
+static void tickNoLivesBlink(){
+  if (!gNoLivesBlinkActive) return;
+  const uint32_t now = millis();
+  if ((int32_t)(now - gNoLivesBlinkNextMs) < 0) return;
+
+  gNoLivesBlinkNextMs = now + kNoLivesBlinkToggleMs;
+  gNoLivesBlinkOn = !gNoLivesBlinkOn;
+
+  if (gNoLivesBlinkOn) {
+    sendGameStateToAll(W_OVER, 150, 0, 0, 1, 0);
+    setAllLamps(true);
+  } else {
+    sendGameStateToAll(W_OVER, 0, 0, 0,   1, 0);
+    setAllLamps(false);
+  }
+
+  if (gNoLivesBlinkTogglesLeft > 0) gNoLivesBlinkTogglesLeft--;
+  if (gNoLivesBlinkTogglesLeft == 0) stopNoLivesBlinkOff();
+}
+
+
 static void processGateEvent(uint8_t gateId, uint8_t ev){
   // When NOT playing, honor ToF visualization by sending an overlay frame (effect=1)
   // so nodes accept LED_RANGE in any state. We only paint on ENTER events.
@@ -878,6 +938,12 @@ static void gameStart(uint32_t seconds){
   gFailGate = 0; gFailBtn = 0;
   gFailBlinkUntil = 0; gFailBlinkNext = 0; gFailBlinkOn = false;
 
+  // Cancel any game-over (no lives) blink sequence from a prior run
+  gNoLivesBlinkActive = false;
+  gNoLivesBlinkOn = false;
+  gNoLivesBlinkTogglesLeft = 0;
+  gNoLivesBlinkNextMs = 0;
+
   gEndPending = false;          // <— ensure no deferred end from prior run
   gEndWin     = false;          // <— clear win/lose latch too
 
@@ -905,25 +971,42 @@ static void gameEnd(bool win){
   gSuccessFeedbackPending = false;
   gSuccessFeedbackUntil   = 0;
 
+  // Stop any prior "no lives" blink sequence (we may re-arm it below)
+  gNoLivesBlinkActive = false;
+  gNoLivesBlinkOn = false;
+  gNoLivesBlinkTogglesLeft = 0;
+  gNoLivesBlinkNextMs = 0;
+
   G.st = GAME_OVER;
   G.deadlineMs = 0;
   gGameDeadlineMs = 0;                 // stop global timer
   setAllLamps(false);
 
-  uint8_t R = win ? 0 : 150, Gc = win ? 150 : 0;
-  sendGameStateToAll(W_OVER, R, Gc, 0);
+  const bool noLivesEnd = (!win && gPmsEndReason && (strcmp(gPmsEndReason, "no_lives") == 0));
 
-  if (!win){
-    // Gate blink disabled (room is already red). Keep button-blink if needed.
-    if (gFailBtn) {
-      beginFailFlashButton(gFailBtn);  // lamp blink still ok
-    }
-    // ensure we don't carry a gate blink forward
+  if (noLivesEnd){
+    // Global red blink -> OFF (no culprit blink; just a clean "game over" animation)
     gFailGate = 0;
+    gFailBtn  = 0;
     gFailBlinkUntil = 0; gFailBlinkNext = 0; gFailBlinkOn = false;
+
+    startNoLivesBlink();
+  } else {
+    uint8_t R = win ? 0 : 150, Gc = win ? 150 : 0;
+    sendGameStateToAll(W_OVER, R, Gc, 0);
+
+    if (!win){
+      // Gate blink disabled (room is already red). Keep button-blink if needed.
+      if (gFailBtn) {
+        beginFailFlashButton(gFailBtn);  // lamp blink still ok
+      }
+      // ensure we don't carry a gate blink forward
+      gFailGate = 0;
+      gFailBlinkUntil = 0; gFailBlinkNext = 0; gFailBlinkOn = false;
+    }
   }
 
-  DBG_PRINTF("[GAME] END (%s) epoch=%u\n", win ? "WIN" : "FAIL", gEpoch);
+  DBG_PRINTF("[GAME] END (%s) reason=%s epoch=%u\n", win ? "WIN" : "FAIL", gPmsEndReason, gEpoch);
 }
 
 static bool startMaze(){
@@ -2141,6 +2224,9 @@ void loop(){
 
   // Drive fail-blink if active
   tickFailFlash();
+
+  // Drive no-lives game-over blink (red flashes -> OFF)
+  tickNoLivesBlink();
 
   dripPump();
   flushLogs();
