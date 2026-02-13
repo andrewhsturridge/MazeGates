@@ -251,12 +251,15 @@ static volatile uint8_t  lampDesiredMask = 0;   // target state
 static volatile uint8_t  lampDirtyMask   = 0;   // which to apply
 
 // One pending LED_RANGE (last-wins)
+// RX callback is producer; loop() is consumer.
 static volatile bool     ledPending   = false;
 static volatile uint8_t  ledP_strip   = 0;
 static volatile uint16_t ledP_start   = 0;
 static volatile uint16_t ledP_count   = 0;
+static volatile uint8_t  ledP_effect  = 0;
 static volatile uint8_t  ledP_r=0, ledP_g=0, ledP_b=0;
 static volatile uint8_t  ledP_epoch   = 0;
+
 
 // Round config
 static volatile bool     rcPending    = false;
@@ -338,34 +341,74 @@ static uint8_t gNodeId=0;
 static uint8_t kBroadcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 
 // ----- Tiny non-blocking TX queue for ESP-NOW -----
-#define TXQ_SIZE 16
-struct TxFrame { uint8_t mac[6]; uint8_t len; uint8_t buf[128]; };
+//
+// Why this exists:
+//   - esp_now_send() is async and can return BUSY under load.
+//   - We never want button/gate events to block the main loop.
+//   - We also never want heavy work (like LED painting) inside callbacks to starve WiFi.
+//
+// This ring buffer stores *framed* (wire-header included) ESPNOW payloads and retries
+// sending them later from loop().
+#define TXQ_SIZE 32
+
+// NOTE: Use MG_WIRE_MAX_PACKET so even OTA_START frames can be queued if needed.
+struct TxFrame { uint8_t mac[6]; uint8_t len; uint8_t buf[MG_WIRE_MAX_PACKET]; };
 static TxFrame txq[TXQ_SIZE];
+
+// Head is written by enqueueTx() (loop or RX callback), tail is advanced by pumpTx() (loop).
 static volatile uint8_t txHead = 0, txTail = 0;
 
-static inline bool enqueueTx(const uint8_t* mac, const void* data, uint8_t len){
-  uint8_t nhead = (uint8_t)((txHead + 1) % TXQ_SIZE);
-  if (nhead == txTail) return false;        // full -> drop (or count drops)
+// Protect head/tail manipulation across cores/tasks.
+static portMUX_TYPE txMux = portMUX_INITIALIZER_UNLOCKED;
 
-  if (len > sizeof(txq[0].buf)) return false;
+static inline bool enqueueTx(const uint8_t* mac, const void* data, uint8_t len){
+  if (len > (uint8_t)sizeof(txq[0].buf)) return false;
+
+  portENTER_CRITICAL(&txMux);
+  uint8_t nhead = (uint8_t)((txHead + 1) % TXQ_SIZE);
+  if (nhead == txTail) { portEXIT_CRITICAL(&txMux); return false; } // full -> drop
   memcpy(txq[txHead].mac, mac, 6);
   memcpy(txq[txHead].buf, data, len);
   txq[txHead].len = len;
   txHead = nhead;
+  portEXIT_CRITICAL(&txMux);
   return true;
-
 }
+
 static void pumpTx(){
-  while (txTail != txHead){
-    TxFrame &f = txq[txTail];
-    esp_err_t r = esp_now_send(f.mac, f.buf, f.len);
-    if (r == ESP_OK) txTail = (uint8_t)((txTail + 1) % TXQ_SIZE);
-    else break; // try again next loop tick
+  while (true){
+    uint8_t idx;
+    uint8_t mac[6];
+    uint8_t len;
+    uint8_t buf[MG_WIRE_MAX_PACKET];
+
+    portENTER_CRITICAL(&txMux);
+    if (txTail == txHead) { portEXIT_CRITICAL(&txMux); return; } // empty
+    idx = txTail;
+    memcpy(mac, txq[idx].mac, 6);
+    len = txq[idx].len;
+    memcpy(buf, txq[idx].buf, len);
+    portEXIT_CRITICAL(&txMux);
+
+    esp_err_t r = esp_now_send(mac, buf, len);
+    if (r == ESP_OK){
+      portENTER_CRITICAL(&txMux);
+      // Advance tail (drop the frame we just queued for send)
+      txTail = (uint8_t)((txTail + 1) % TXQ_SIZE);
+      portEXIT_CRITICAL(&txMux);
+      continue;
+    }
+    // BUSY/FAIL -> try again next loop tick
+    break;
   }
 }
+
 static void onNowSent(const wifi_tx_info_t* info, esp_now_send_status_t status) {
-  pumpTx();  // kick the TX queue again
+  (void)info; (void)status;
+  // Intentionally empty:
+  // pumpTx() is called from loop() to avoid re-entrancy / cross-core races.
 }
+
 
 static void sendRaw(const uint8_t* mac, const uint8_t* data, size_t len){
   // Frame the payload with MazeGates wire header (magic + wire version).
@@ -517,18 +560,27 @@ static void onNowRecv(const esp_now_recv_info* info, const uint8_t* data, int le
   // LED_RANGE:
   //  - PLAYING: accept all
   //  - other states: accept only overlay effect==1 (used for fail-flash)
+  //
+  // IMPORTANT:
+  //   Do NOT touch NeoPixel buffers here. The ESP-NOW RX callback runs on the WiFi task.
+  //   Writing long LED ranges inside the callback can starve WiFi and delay/drop other packets.
+  //   We just latch the message and let loop() apply it.
   if (h->type == LED_RANGE && len >= (int)sizeof(LedRangeMsg)) {
     const LedRangeMsg* m = (const LedRangeMsg*)data;
     if (nodeState != NODE_PLAYING && m->effect != 1) return;
-    if (m->strip < stripCount && strips[m->strip]) {
-      uint16_t end = m->start + m->count;
-      if (end > cfg[m->strip].count) end = cfg[m->strip].count;
-      for (uint16_t i=m->start; i<end; ++i)
-        strips[m->strip]->setPixelColor(i, strips[m->strip]->Color(m->r,m->g,m->b));
-      ledDirty = true;
-    }
+
+    ledP_strip  = m->strip;
+    ledP_start  = m->start;
+    ledP_count  = m->count;
+    ledP_effect = m->effect;
+    ledP_r      = m->r;
+    ledP_g      = m->g;
+    ledP_b      = m->b;
+    ledP_epoch  = h->pad;
+    ledPending  = true;
     return;
   }
+
 
   // LAMP_CTRL: set desired bit and mark dirty (always honored)
   if (h->type==LAMP_CTRL && len >= (int)sizeof(LampCtrlMsg)) {
@@ -1035,6 +1087,9 @@ void loop(){
   // 1) Apply pending GAME_STATE first (barrier)
   applyGameStatePending();
 
+  // Keep radio TX queue moving (flush early so queued events don't wait behind sensing work)
+  pumpTx();
+
   // Intermission blink (all gates)
   if (nodeState == NODE_INTERMISSION){
     uint32_t now = millis();
@@ -1065,9 +1120,10 @@ void loop(){
 
   // 2) Sensing only while playing (buttons + ToF)
   const bool doSense = (nodeState == NODE_PLAYING) && nodeArmed && !gOtaMode;
-  if (doSense){
-    for (uint8_t ch=0; ch<8; ch++) pollOne(ch);
+    if (doSense){
+    // Buttons first for lowest perceived latency (ToF polling can take a few ms per channel)
     pollButtons();
+    for (uint8_t ch=0; ch<8; ch++) pollOne(ch);
   }
 
   // 3) Apply pending lamps (always honored; last-wins)
@@ -1083,16 +1139,23 @@ void loop(){
     if (mask & 0x04){ digitalWrite(PIN_LAMP3, (lampDesiredMask & 0x04) ? HIGH : LOW); }
   }
 
-  // 4) Apply one pending LED paint (PLAYING only; last-wins)
-  if (nodeState == NODE_PLAYING && ledPending){
+  // 4) Apply one pending LED paint (last-wins; deferred from ESP-NOW RX callback)
+  if (ledPending){
     // snapshot and clear
-    uint8_t  strip = ledP_strip;
-    uint16_t start = ledP_start, count = ledP_count;
-    uint8_t  r=ledP_r, g=ledP_g, b=ledP_b;
-    uint8_t  epoch = ledP_epoch;
+    uint8_t  strip  = ledP_strip;
+    uint16_t start  = ledP_start;
+    uint16_t count  = ledP_count;
+    uint8_t  effect = ledP_effect;
+    uint8_t  r      = ledP_r;
+    uint8_t  g      = ledP_g;
+    uint8_t  b      = ledP_b;
+    uint8_t  epoch  = ledP_epoch;
     ledPending = false;
 
-    if (epoch==0 || epoch==currentEpoch){
+    // Defensive: prevent non-overlay paints from leaking into non-playing states
+    if (nodeState != NODE_PLAYING && effect != 1) {
+      // drop
+    } else if (epoch==0 || epoch==currentEpoch){
       if (strip < stripCount && strips[strip]){
         uint16_t end = start + count;
         uint16_t cap = cfg[strip].count;
@@ -1103,6 +1166,7 @@ void loop(){
       }
     }
   }
+
 
   // 5) Render LED buffers if anything changed
   render();

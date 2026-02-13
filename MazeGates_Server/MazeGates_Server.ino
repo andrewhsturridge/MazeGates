@@ -94,7 +94,7 @@ static constexpr size_t  MG_WIRE_MAX_PACKET = 250;
 // 1 = Keep legacy/debug Serial prints (help banners, CLI confirmations, logs).
 // 0 = Suppress all non-!PMS output (recommended for production PMS wiring).
 #ifndef PMS_DEBUG_SERIAL
-#define PMS_DEBUG_SERIAL 1
+#define PMS_DEBUG_SERIAL 0
 #endif
 
 // PMS STATUS tick period (ms)
@@ -1442,12 +1442,12 @@ static void handlePmsCommand(String line) {
 
 #if PMS_STD_ENABLED
 
-static uint32_t gPmsLastTickMs  = 0;
 static bool     gPmsInit        = false;
 static bool     gPmsLastActive  = false;
 static bool     gPmsLastPlaying = false;
 static uint32_t gPmsLastScore   = 0;
 static uint8_t  gPmsLastLives   = 0;
+static uint32_t gPmsLastStatusTickMs = 0;
 
 static const char* pmsLastReasonStr(bool stateChanged, int32_t scoreDelta, int32_t livesDelta) {
   if (livesDelta < 0) return "life";
@@ -1458,63 +1458,75 @@ static const char* pmsLastReasonStr(bool stateChanged, int32_t scoreDelta, int32
 
 static void pmsTick() {
   const uint32_t now = millis();
-  if (now - gPmsLastTickMs < (uint32_t)PMS_STATUS_PERIOD_MS) return;
-  gPmsLastTickMs = now;
 
   const bool active  = (gGameDeadlineMs != 0);
   const bool playing = (G.st == PLAYING);
 
-  const uint8_t  level   = gPmsLevel;
-  const uint32_t score   = gPmsScore;
-  const uint8_t  lives   = gLivesRemaining;
+  const uint8_t  level = gPmsLevel;
+  const uint32_t score = gPmsScore;
+  const uint8_t  lives = gLivesRemaining;
 
   uint32_t tleftMs = 0;
   if (gGameDeadlineMs) {
     tleftMs = (gGameDeadlineMs > now) ? (gGameDeadlineMs - now) : 0;
   }
 
+  // Initialize baseline on first tick. We treat the "previous" state as idle,
+  // so if a game is already active we still emit a game_start the first time.
   if (!gPmsInit) {
-    gPmsInit        = true;
-    gPmsLastActive  = active;
-    gPmsLastPlaying = playing;
-    gPmsLastScore   = score;
-    gPmsLastLives   = lives;
-
-    // Do not emit STATUS while idle
-    if (active) {
-      const char* st = playing ? "playing" : "arming";
-      pmsPrintStatus(st, level, score, lives, tleftMs, "none");
-    }
-    return;
+    gPmsInit             = true;
+    gPmsLastActive       = false;
+    gPmsLastPlaying      = playing;
+    gPmsLastScore        = score;
+    gPmsLastLives        = lives;
+    gPmsLastStatusTickMs = 0;
   }
 
-  // game_start / game_end transitions
-  if (!gPmsLastActive && active) {
+  const int32_t scoreDelta = (int32_t)score - (int32_t)gPmsLastScore;
+  const int32_t livesDelta = (int32_t)lives - (int32_t)gPmsLastLives;
+
+  const bool startTransition = (!gPmsLastActive && active);
+  const bool endTransition   = (gPmsLastActive && !active);
+
+  bool stateChanged = (playing != gPmsLastPlaying);
+  if (startTransition) stateChanged = true;
+
+  // STATUS is periodic, but we also push an immediate STATUS on game_start and
+  // when the state flips arming<->playing so the PMS UI stays snappy.
+  const bool dueStatus = (active && (now - gPmsLastStatusTickMs >= (uint32_t)PMS_STATUS_PERIOD_MS));
+  const bool wantImmediateStatus = (active && (startTransition || stateChanged));
+
+  const bool emitScore = (active && scoreDelta > 0);
+  const bool emitLife  = (active && livesDelta < 0);
+
+  const bool needOutput =
+      startTransition || endTransition || emitScore || emitLife || dueStatus || wantImmediateStatus;
+
+  if (!needOutput) return;
+
+  // Transitions first
+  if (startTransition) {
     pmsPrintEventGameStart(level);
-  } else if (gPmsLastActive && !active) {
+  } else if (endTransition) {
     // End reason was latched by game logic (timeup/no_lives/stopped)
     pmsPrintEventGameEnd(gPmsEndReason, score, lives);
   }
 
-  // While active, emit score/life events and STATUS ticks
-  if (active) {
-    const int32_t scoreDelta = (int32_t)score - (int32_t)gPmsLastScore;
-    const int32_t livesDelta = (int32_t)lives - (int32_t)gPmsLastLives;
-    const bool stateChanged  = (playing != gPmsLastPlaying);
+  // Point events
+  if (emitScore) pmsPrintEventScore(scoreDelta, score);
+  if (emitLife)  pmsPrintEventLife(livesDelta, lives);
 
-    if (scoreDelta > 0) {
-      pmsPrintEventScore(scoreDelta, score);
-    }
-    if (livesDelta < 0) {
-      pmsPrintEventLife(livesDelta, lives);
-    }
-
+  // STATUS (never while idle)
+  if (active && (dueStatus || wantImmediateStatus)) {
     const char* st = playing ? "playing" : "arming";
-    const char* lastReason = pmsLastReasonStr(stateChanged, scoreDelta, livesDelta);
+    const char* lastReason = pmsLastReasonStr(stateChanged,
+                                              emitScore ? scoreDelta : 0,
+                                              emitLife  ? livesDelta : 0);
     pmsPrintStatus(st, level, score, lives, tleftMs, lastReason);
+    gPmsLastStatusTickMs = now;
   }
 
-  // Update baseline
+  // Update baseline (what we've reported so far)
   gPmsLastActive  = active;
   gPmsLastPlaying = playing;
   gPmsLastScore   = score;
@@ -1986,6 +1998,40 @@ static void handleCli(String s){
   DBG_PRINTLN("Unknown command. Type: help");
 }
 
+
+// Non-blocking serial line pump.
+// - Avoids the ~1s default timeout stall of Serial.readStringUntil()
+// - Prevents loop() stalls that can delay !PMS EVENT output
+static void serialPumpCli(){
+  static char buf[256];
+  static uint16_t len = 0;
+
+  // Safety: don't spend unbounded time draining serial in one loop() iteration.
+  uint16_t bytes = 0;
+  while (Serial.available() && bytes < 256){
+    const int ch = Serial.read();
+    if (ch < 0) break;
+    bytes++;
+
+    const char c = (char)ch;
+    if (c == '\r') continue;
+
+    if (c == '\n'){
+      buf[len] = '\0';
+      handleCli(String(buf));
+      len = 0;
+      continue;
+    }
+
+    if (len < (sizeof(buf) - 1)){
+      buf[len++] = c;
+    } else {
+      // Overflow: drop the current line
+      len = 0;
+    }
+  }
+}
+
 void loop(){
   // Finish a deferred end (we already added this scheduler earlier)
   if (gEndPending){ gEndPending=false; gameEnd(gEndWin); }
@@ -2099,9 +2145,6 @@ void loop(){
   dripPump();
   flushLogs();
 
-  // PMS tick (STATUS + EVENTS)
-  pmsTick();
-
   // Auto-off for echo pulses
   uint32_t nowMs = millis();
   for (uint8_t b=1; b<=12; ++b){
@@ -2112,8 +2155,9 @@ void loop(){
     }
   }
 
-  if (Serial.available()){
-    String s=Serial.readStringUntil('\n');
-    handleCli(s);
-  }
+  // Pump serial input (CLI + !PMS commands) without blocking loop()
+  serialPumpCli();
+
+  // PMS tick (STATUS + EVENTS) — run after game logic AND after processing commands
+  pmsTick();
 }
