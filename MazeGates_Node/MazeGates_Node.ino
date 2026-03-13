@@ -274,12 +274,18 @@ static bool chPresent[8] = {0,0,0,0,0,0,0,0};
 static bool chNeedsClearAfterArm[8] = {0,0,0,0,0,0,0,0};
 
 static uint32_t lastEnterSentMs[8] = {0};
+static uint8_t  chClearStreak[8] = {0,0,0,0,0,0,0,0};
+static uint32_t chClearSinceMs[8] = {0,0,0,0,0,0,0,0};
 #define ENTER_COOLDOWN_MS 150   // 0 = off; 150ms ≈ ~6–7 msgs/sec max per ch
+#define CLEAR_POLLS_AFTER_ARM 2
+#define CLEAR_MS_AFTER_ARM    120
 
 static void resetPresenceForNewRound(){
   for (uint8_t i=0;i<8;i++){
     chPresent[i] = false;
-    chNeedsClearAfterArm[i] = true;   // must see one clear frame before first ENTER
+    chNeedsClearAfterArm[i] = true;   // must see a stable clear window before first ENTER
+    chClearStreak[i] = 0;
+    chClearSinceMs[i] = 0;
     lastEnterSentMs[i] = 0;           // optional: drop any cooldown history
   }
 }
@@ -319,6 +325,19 @@ static void nodeEnterOver(uint8_t epoch, uint8_t r, uint8_t g, uint8_t b){
   nodeArmed = false;                 // ← disarm
   fillAllStrips(r,g,b);
   Serial.printf("[STATE] -> OVER  rgb(%u,%u,%u) epoch=%u\n", r,g,b,currentEpoch);
+}
+
+static inline bool epochIsOlderThan(uint8_t incoming, uint8_t baseline){
+  if (incoming == 0 || baseline == 0) return false;
+  return (int8_t)(incoming - baseline) < 0;
+}
+
+static uint8_t newestTrackedEpoch(){
+  uint8_t newest = currentEpoch;
+  if (statePending && !epochIsOlderThan(pendingEpoch, newest)) newest = pendingEpoch;
+  if (rcPending    && !epochIsOlderThan(rcEpoch, newest))      newest = rcEpoch;
+  if (ledPending   && !epochIsOlderThan(ledP_epoch, newest))   newest = ledP_epoch;
+  return newest;
 }
 
 static void applyGameStatePending(){
@@ -517,12 +536,14 @@ static void onNowRecv(const esp_now_recv_info* info, const uint8_t* data, int le
   if (h->version!=PROTO_VER) return;
 
   if (h->type == GAME_STATE && len >= (int)sizeof(GameStateMsg)){
+    if (epochIsOlderThan(h->pad, newestTrackedEpoch())) return;
+
     const GameStateMsg* m = (const GameStateMsg*)data;
     pendingEpoch = h->pad;
     switch (m->state) {          // 0..3 come from the server
       case 1: pendingState = NODE_PLAYING;      break; // W_PLAYING
       case 2: pendingState = NODE_OVER;         break; // W_OVER
-      case 3: pendingState = NODE_INTERMISSION; break; // W_INTERMISSION  <— NEW
+      case 3: pendingState = NODE_INTERMISSION; break; // W_INTERMISSION
       default: pendingState = NODE_IDLE;        break; // W_IDLE
     }
     pendingR = m->r; pendingG = m->g; pendingB = m->b;
@@ -531,6 +552,8 @@ static void onNowRecv(const esp_now_recv_info* info, const uint8_t* data, int le
   }
 
   if (h->type == ROUND_CFG && len >= (int)sizeof(RoundCfgMsg)){
+    if (epochIsOlderThan(h->pad, newestTrackedEpoch())) return;
+
     const RoundCfgMsg* r = (const RoundCfgMsg*)data;
     rcEpoch = h->pad;
     rcNT    = r->nTargets;
@@ -991,10 +1014,14 @@ static void pollOne(uint8_t i) {
     i2cBusy=false;
 
     if (updated) {
-      // We detected a valid target on channel ch
-      // If we haven't seen a clear frame since arming, suppress until it's clear once.
+      // We detected a valid target on channel ch.
+      // Right after arming, require a *stable* clear window before the first ENTER.
+      // This prevents the previous round's "last button area" presence from immediately
+      // re-firing on the next round because of one noisy clear sample.
       if (chNeedsClearAfterArm[ch]) {
         chPresent[ch] = true;    // remember it's currently present
+        chClearStreak[ch] = 0;
+        chClearSinceMs[ch] = 0;
         return;                  // but DO NOT send ENTER yet
       }
 
@@ -1014,8 +1041,17 @@ static void pollOne(uint8_t i) {
       // No valid target this poll -> mark clear.
       if (chPresent[ch]) chPresent[ch] = false;
 
-      // The first clear frame after arming unlocks this channel.
-      if (chNeedsClearAfterArm[ch]) chNeedsClearAfterArm[ch] = false;
+      // After arming, require two consecutive clear polls and at least ~120 ms of clear dwell
+      // before the channel is allowed to send its first ENTER.
+      if (chNeedsClearAfterArm[ch]) {
+        if (chClearSinceMs[ch] == 0) chClearSinceMs[ch] = now;
+        if (chClearStreak[ch] < 255) chClearStreak[ch]++;
+
+        if (chClearStreak[ch] >= CLEAR_POLLS_AFTER_ARM &&
+            (uint32_t)(now - chClearSinceMs[ch]) >= CLEAR_MS_AFTER_ARM) {
+          chNeedsClearAfterArm[ch] = false;
+        }
+      }
     }
   } else {
     tcaDeselectAll();
