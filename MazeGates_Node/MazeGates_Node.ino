@@ -61,7 +61,7 @@ static constexpr size_t  MG_WIRE_MAX_PACKET = 250;
 
 // ---------- Feature switches ----------
 #undef  ACCEPT_RS5
-#define ACCEPT_RS5 1
+#define ACCEPT_RS5 0
 
 // ---------- Fixed pins (I2C / lamps defaults) ----------
 #define PIN_SDA 8
@@ -327,19 +327,6 @@ static void nodeEnterOver(uint8_t epoch, uint8_t r, uint8_t g, uint8_t b){
   Serial.printf("[STATE] -> OVER  rgb(%u,%u,%u) epoch=%u\n", r,g,b,currentEpoch);
 }
 
-static inline bool epochIsOlderThan(uint8_t incoming, uint8_t baseline){
-  if (incoming == 0 || baseline == 0) return false;
-  return (int8_t)(incoming - baseline) < 0;
-}
-
-static uint8_t newestTrackedEpoch(){
-  uint8_t newest = currentEpoch;
-  if (statePending && !epochIsOlderThan(pendingEpoch, newest)) newest = pendingEpoch;
-  if (rcPending    && !epochIsOlderThan(rcEpoch, newest))      newest = rcEpoch;
-  if (ledPending   && !epochIsOlderThan(ledP_epoch, newest))   newest = ledP_epoch;
-  return newest;
-}
-
 static void applyGameStatePending(){
   if (!statePending) return;
   statePending = false;
@@ -536,14 +523,12 @@ static void onNowRecv(const esp_now_recv_info* info, const uint8_t* data, int le
   if (h->version!=PROTO_VER) return;
 
   if (h->type == GAME_STATE && len >= (int)sizeof(GameStateMsg)){
-    if (epochIsOlderThan(h->pad, newestTrackedEpoch())) return;
-
     const GameStateMsg* m = (const GameStateMsg*)data;
     pendingEpoch = h->pad;
     switch (m->state) {          // 0..3 come from the server
       case 1: pendingState = NODE_PLAYING;      break; // W_PLAYING
       case 2: pendingState = NODE_OVER;         break; // W_OVER
-      case 3: pendingState = NODE_INTERMISSION; break; // W_INTERMISSION
+      case 3: pendingState = NODE_INTERMISSION; break; // W_INTERMISSION  <— NEW
       default: pendingState = NODE_IDLE;        break; // W_IDLE
     }
     pendingR = m->r; pendingG = m->g; pendingB = m->b;
@@ -552,8 +537,6 @@ static void onNowRecv(const esp_now_recv_info* info, const uint8_t* data, int le
   }
 
   if (h->type == ROUND_CFG && len >= (int)sizeof(RoundCfgMsg)){
-    if (epochIsOlderThan(h->pad, newestTrackedEpoch())) return;
-
     const RoundCfgMsg* r = (const RoundCfgMsg*)data;
     rcEpoch = h->pad;
     rcNT    = r->nTargets;
@@ -1015,9 +998,9 @@ static void pollOne(uint8_t i) {
 
     if (updated) {
       // We detected a valid target on channel ch.
-      // Right after arming, require a *stable* clear window before the first ENTER.
-      // This prevents the previous round's "last button area" presence from immediately
-      // re-firing on the next round because of one noisy clear sample.
+      // Right after arming, require a stable clear window before the first ENTER.
+      // This prevents lingering presence near the previous round's last button area
+      // from immediately re-firing at the start of the next round.
       if (chNeedsClearAfterArm[ch]) {
         chPresent[ch] = true;    // remember it's currently present
         chClearStreak[ch] = 0;
@@ -1041,7 +1024,7 @@ static void pollOne(uint8_t i) {
       // No valid target this poll -> mark clear.
       if (chPresent[ch]) chPresent[ch] = false;
 
-      // After arming, require two consecutive clear polls and at least ~120 ms of clear dwell
+      // After arming, require two consecutive clear polls and ~120 ms of clear dwell
       // before the channel is allowed to send its first ENTER.
       if (chNeedsClearAfterArm[ch]) {
         if (chClearSinceMs[ch] == 0) chClearSinceMs[ch] = now;

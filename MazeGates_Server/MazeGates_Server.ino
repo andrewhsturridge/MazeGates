@@ -17,7 +17,7 @@
  *     !PMS STATUS v=1 state=arming|playing level=.. score=.. lives=.. tleft_ms=.. last_reason=..
  *       (STATUS is NOT emitted while idle)
  *     !PMS EVENT v=1 name=game_start level=..
- *     !PMS EVENT v=1 name=game_end reason=timeup|no_lives|stopped score=.. lives=..
+ *     !PMS EVENT v=1 name=game_end reason=success|no_lives|stopped score=.. lives=..
  *     !PMS EVENT v=1 name=score delta=.. total=.. bonus=0|1
  *     !PMS EVENT v=1 name=life delta=-1 lives=..
  *
@@ -126,7 +126,7 @@ static bool gTestMode = false;
 static uint8_t  gPmsLevel     = 1;      // last START level (1..3)
 static uint32_t gPmsScore     = 0;      // total correct button presses (PMS score)
 static uint16_t gStartStage   = 0;      // stage offset used to approximate difficulty selection
-static const char* gPmsEndReason = "stopped"; // used for EVENT name=game_end (timeup|no_lives|stopped)
+static const char* gPmsEndReason = "stopped"; // used for EVENT name=game_end (success|no_lives|stopped)
 
 // Track OTA start and completion (server-side inference)
 static std::map<uint8_t, uint32_t> lastOtaStartMs;       // nodeId -> millis() when we sent OTA_START
@@ -267,11 +267,6 @@ static uint16_t gSeq=1;
 static uint8_t  kBroadcast[6]={0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 static uint8_t  gEpoch=0;   // <— declared early so helpers can use it
 
-static inline void bumpEpoch(){
-  ++gEpoch;
-  if (gEpoch == 0) ++gEpoch;   // keep 0 reserved as the legacy / wildcard epoch
-}
-
 struct NodeInfo { uint8_t nodeId; uint8_t mac[6]; };
 static std::map<uint8_t, NodeInfo> nodesById;
 
@@ -337,9 +332,6 @@ static void addOrUpdateNode(uint8_t nodeId, const uint8_t mac[6]){
   NodeInfo n{nodeId,{0}}; memcpy(n.mac,mac,6); nodesById[nodeId]=n;
   esp_now_peer_info_t p{}; memcpy(p.peer_addr,mac,6); p.channel=MAZEGATES_CHANNEL; p.encrypt=false; p.ifidx = WIFI_IF_STA; esp_now_add_peer(&p);
 }
-
-static void queueRaw(const uint8_t mac[6], const uint8_t* data, size_t len);
-
 static void sendRaw(const uint8_t mac[6], const uint8_t* data, size_t len){
   // Frame the payload with MazeGates wire header (magic + wire version).
   const size_t outLen = len + MG_WIRE_HDR_LEN;
@@ -351,89 +343,47 @@ static void sendRaw(const uint8_t mac[6], const uint8_t* data, size_t len){
   buf[2] = MG_WIRE_VERSION;
   memcpy(buf + MG_WIRE_HDR_LEN, data, len);
 
-  if (esp_now_send(mac, buf, outLen) == ESP_OK) return;
-  queueRaw(mac, data, len);
+  esp_now_send(mac, buf, outLen);
 }
 static void bcastHelloReq(){ HelloMsg m{}; m.h={HELLO_REQ,PROTO_VER,0,0,gSeq++,sizeof(HelloMsg)}; m.role=0; m.caps=0; sendRaw(kBroadcast,(uint8_t*)&m,sizeof(m)); }
 static void sendClaim(const uint8_t mac[6], uint8_t nodeId){ ClaimMsg m{}; m.h={CLAIM,PROTO_VER,0,0,gSeq++,sizeof(ClaimMsg)}; m.newNodeId=nodeId; sendRaw(mac,(uint8_t*)&m,sizeof(m)); }
 
 // ======= Drip TX queue =======
-#define TXQ_SIZE 64
-struct TxItem { uint8_t mac[6]; uint8_t len; uint8_t buf[MG_WIRE_MAX_PACKET]; };
-static TxItem txQ[TXQ_SIZE];
+struct TxItem { uint8_t mac[6]; uint8_t len; uint8_t buf[128]; };
+static TxItem txQ[64];
 static volatile uint8_t qHead = 0, qTail = 0;
 static uint32_t lastTxMs = 0;
 static const uint16_t DRIP_MS = 5;
-static portMUX_TYPE txQMux = portMUX_INITIALIZER_UNLOCKED;
-
-static inline uint8_t txQNext(uint8_t idx){
-  return (uint8_t)((idx + 1) & (TXQ_SIZE - 1));
-}
 
 static void _enqueueTx(const uint8_t mac[6], const void* data, uint8_t len){
+  uint8_t next = (uint8_t)((qTail + 1) & 63);
+  if (next == qHead) qHead = (uint8_t)((qHead + 1) & 63); // drop oldest
+
+  // Frame the payload into the queue buffer.
   const uint16_t outLen = (uint16_t)len + (uint16_t)MG_WIRE_HDR_LEN;
-  if (outLen > sizeof(txQ[0].buf)) return;
+  if (outLen > sizeof(txQ[qTail].buf)) return;
 
-  portENTER_CRITICAL(&txQMux);
+  memcpy(txQ[qTail].mac, mac, 6);
+  txQ[qTail].len = (uint8_t)outLen;
 
-  uint8_t tail = qTail;
-  uint8_t next = txQNext(tail);
-  if (next == qHead) qHead = txQNext(qHead); // drop oldest
-
-  memcpy(txQ[tail].mac, mac, 6);
-  txQ[tail].len = (uint8_t)outLen;
-  txQ[tail].buf[0] = MG_WIRE_MAGIC0;
-  txQ[tail].buf[1] = MG_WIRE_MAGIC1;
-  txQ[tail].buf[2] = MG_WIRE_VERSION;
-  memcpy(txQ[tail].buf + MG_WIRE_HDR_LEN, data, len);
+  txQ[qTail].buf[0] = MG_WIRE_MAGIC0;
+  txQ[qTail].buf[1] = MG_WIRE_MAGIC1;
+  txQ[qTail].buf[2] = MG_WIRE_VERSION;
+  memcpy(txQ[qTail].buf + MG_WIRE_HDR_LEN, data, len);
 
   qTail = next;
-  portEXIT_CRITICAL(&txQMux);
 }
-
-static void queueRaw(const uint8_t mac[6], const uint8_t* data, size_t len){
-  if (len > (MG_WIRE_MAX_PACKET - MG_WIRE_HDR_LEN)) return;
-  _enqueueTx(mac, data, (uint8_t)len);
-}
-
 static void dripPump(){
+  if (qHead == qTail) return;
   if (millis() - lastTxMs < DRIP_MS) return;
-
-  uint8_t mac[6];
-  uint8_t buf[MG_WIRE_MAX_PACKET];
-  uint8_t len = 0;
-
-  portENTER_CRITICAL(&txQMux);
-  if (qHead == qTail){
-    portEXIT_CRITICAL(&txQMux);
-    return;
-  }
-
-  uint8_t head = qHead;
-  memcpy(mac, txQ[head].mac, 6);
-  len = txQ[head].len;
-  memcpy(buf, txQ[head].buf, len);
-  qHead = txQNext(head);
-  portEXIT_CRITICAL(&txQMux);
-
-  esp_now_send(mac, buf, len);
+  esp_now_send(txQ[qHead].mac, txQ[qHead].buf, txQ[qHead].len);
   lastTxMs = millis();
+  qHead = (uint8_t)((qHead + 1) & 63);
 }
-
-static inline void txQClear(){
-  portENTER_CRITICAL(&txQMux);
-  qHead = qTail;
-  portEXIT_CRITICAL(&txQMux);
-}
-
+static inline void txQClear(){ qHead = qTail; }
 static void flushTxQueueQuickly(uint16_t ms=120){
   uint32_t t0 = millis();
-  while ((millis() - t0) < ms){
-    bool empty;
-    portENTER_CRITICAL(&txQMux);
-    empty = (qHead == qTail);
-    portEXIT_CRITICAL(&txQMux);
-    if (empty) break;
+  while (qHead != qTail && (millis() - t0) < ms){
     dripPump();
     delay(2);
   }
@@ -441,16 +391,12 @@ static void flushTxQueueQuickly(uint16_t ms=120){
 
 // ======= Send helpers (explicit header writes) =======
 static void sendGameStateToAll(uint8_t state, uint8_t r, uint8_t g, uint8_t b, int repeats=3, int gap_ms=3){
-  if (repeats < 1) repeats = 1;
-
   GameStateMsg m{}; m.h={GAME_STATE,PROTO_VER,0,gEpoch,gSeq++,(uint16_t)sizeof(GameStateMsg)};
   m.state=state; m.r=r; m.g=g; m.b=b;
-
   for(int rep=0; rep<repeats; ++rep){
-    queueRaw(kBroadcast,(uint8_t*)&m,sizeof(m));
-    for (auto &kv : nodesById) queueRaw(kv.second.mac,(uint8_t*)&m,sizeof(m));
-    flushTxQueueQuickly(90);
-    if (gap_ms > 0) delay(gap_ms);
+    sendRaw(kBroadcast,(uint8_t*)&m,sizeof(m));
+    for (auto &kv : nodesById) sendRaw(kv.second.mac,(uint8_t*)&m,sizeof(m));
+    delay(gap_ms);
   }
 }
 static void sendGameStateBroadcast(uint8_t state, uint8_t r, uint8_t g, uint8_t b){
@@ -491,10 +437,8 @@ static void sendOtaStart(uint8_t nodeId, const String& url){
 }
 
 // ======= ROUND_CFG sender =======
-static void sendRoundCfg(const uint8_t* targets, uint8_t nTargets, const uint8_t* walkBits, int repeats=3, int gap_ms=3){
+static void sendRoundCfg(const uint8_t* targets, uint8_t nTargets, const uint8_t* walkBits){
   if (nTargets>12) nTargets=12;
-  if (repeats < 1) repeats = 1;
-
   RoundCfgMsg m{};
   m.h.type=ROUND_CFG; m.h.version=PROTO_VER; m.h.nodeId=0; m.h.pad=gEpoch;
   m.h.seq=gSeq++;     m.h.len=sizeof(RoundCfgMsg);
@@ -502,13 +446,7 @@ static void sendRoundCfg(const uint8_t* targets, uint8_t nTargets, const uint8_t
   for (uint8_t i=0;i<nTargets;i++) m.targets[i]=targets[i];
   memset(m.walkBits, 0, sizeof(m.walkBits));
   if (walkBits) memcpy(m.walkBits, walkBits, 6);
-
-  for (int rep=0; rep<repeats; ++rep){
-    queueRaw(kBroadcast, (uint8_t*)&m, sizeof(m));
-    for (auto &kv : nodesById) queueRaw(kv.second.mac, (uint8_t*)&m, sizeof(m));
-    flushTxQueueQuickly(90);
-    if (gap_ms > 0) delay(gap_ms);
-  }
+  sendRaw(kBroadcast, (uint8_t*)&m, sizeof(m));
 }
 
 // ======= Routing helpers =======
@@ -1086,10 +1024,6 @@ static bool startMaze(){
   gFailGate = 0; gFailBtn  = 0;
   gFailBlinkUntil = 0; gFailBlinkNext = 0; gFailBlinkOn = false;
 
-  // Drop any stale queued overlays / lamp commands from the prior feedback cycle
-  // before we fan out a brand-new PLAYING + ROUND_CFG burst.
-  txQClear();
-
   // ---- Stage-based progression ----
   //  - Each success: stage++ (handled after intermission)
   //  - main path length increases with stage (clamped)
@@ -1213,11 +1147,11 @@ static bool startMaze(){
   setWalkableFromBits(wb);
 
   // Epoch bump so nodes accept fresh config
-  bumpEpoch();
+  gEpoch++;
 
-  // Flip nodes to PLAYING and send round config.
-  // Both fan-outs are queued + repeated so a missed burst does not leave nodes white.
+  // Flip nodes to PLAYING and send round config
   sendGameStateToAll(W_PLAYING, 0,0,0);
+  delay(10);
   sendRoundCfg(targets, nTargets, wb);
 
   // Arm the maze timer + targets
@@ -1667,7 +1601,7 @@ static void pmsTick() {
   if (startTransition) {
     pmsPrintEventGameStart(level);
   } else if (endTransition) {
-    // End reason was latched by game logic (timeup/no_lives/stopped)
+    // End reason was latched by game logic (success/no_lives/stopped)
     pmsPrintEventGameEnd(gPmsEndReason, score, lives);
   }
 
@@ -2101,7 +2035,7 @@ static void handleCli(String s){
   if (s.startsWith("poc start")){
     int secs = 20; sscanf(s.c_str(), "poc start %d", &secs);
 
-    bumpEpoch();              // new epoch
+    gEpoch++;                 // new epoch
     G.st = PLAYING;
     G.nTargets = 1;
     memset(G.targets, 0, sizeof(G.targets));
@@ -2285,7 +2219,7 @@ void loop(){
 
   // Game hard timer -> win
   if (gGameDeadlineMs && (int32_t)(millis() - gGameDeadlineMs) >= 0){
-    gPmsEndReason = "timeup";
+    gPmsEndReason = "success";
     gGameDeadlineMs = 0; scheduleGameEnd(true);
   }
 
