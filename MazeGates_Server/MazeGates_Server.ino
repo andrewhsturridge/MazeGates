@@ -168,6 +168,12 @@ static const uint32_t kLifeFeedbackMs  = 4000;   // 10 toggles @ 400ms ≈ 5 red
 // Per-maze success flash (green) before intermission blink
 static const uint32_t kSuccessFeedbackMs = 1200;
 
+// After an overall-game SUCCESS (session timer survived), hold the final green room
+// for a short period, then turn the room dark while staying in W_OVER.
+// Set to 0 to keep the green end state latched indefinitely.
+static const uint32_t kWinLightsHoldMs = 3000;
+static uint32_t       gWinLightsOffAt  = 0;
+
 // Game-over blink sequence:
 // When the game ends due to NO_LIVES or STOPPED, blink the whole room red a few times, then turn OFF.
 // This is server-driven (GAME_STATE toggles), so nodes require no special support.
@@ -947,6 +953,7 @@ static void gameStart(uint32_t seconds){
 
   gSuccessFeedbackPending = false;
   gSuccessFeedbackUntil   = 0;
+  gWinLightsOffAt         = 0;
 
   // If an end-blink is in progress (no_lives/stopped), cancel it on new START.
   resetNoLivesBlinkState();
@@ -980,6 +987,7 @@ static void gameEnd(bool win){
   // Cancel any in-flight success feedback
   gSuccessFeedbackPending = false;
   gSuccessFeedbackUntil   = 0;
+  gWinLightsOffAt         = 0;
 
   G.st = GAME_OVER;
   G.deadlineMs = 0;
@@ -990,8 +998,11 @@ static void gameEnd(bool win){
   resetNoLivesBlinkState();
 
   if (win){
-    // WIN: solid green
+    // WIN: solid green, then dark after a short hold while staying in W_OVER.
     sendGameStateToAll(W_OVER, 0, 150, 0);
+    if (kWinLightsHoldMs > 0){
+      gWinLightsOffAt = millis() + kWinLightsHoldMs;
+    }
   } else {
     // FAIL:
     // - NO_LIVES and STOPPED: blink red a few times then OFF
@@ -2221,6 +2232,13 @@ void loop(){
   if (gGameDeadlineMs && (int32_t)(millis() - gGameDeadlineMs) >= 0){
     gPmsEndReason = "success";
     gGameDeadlineMs = 0; scheduleGameEnd(true);
+  }
+
+  // After a successful overall-game win, turn the final green room lights off
+  // after a short hold while keeping nodes in W_OVER.
+  if (gWinLightsOffAt && G.st == GAME_OVER && (int32_t)(millis() - gWinLightsOffAt) >= 0){
+    gWinLightsOffAt = 0;
+    sendGameStateToAll(W_OVER, 0, 0, 0);
   }
 
   // Maze timer (strict -> fail)

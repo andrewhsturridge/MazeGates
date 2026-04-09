@@ -277,8 +277,8 @@ static uint32_t lastEnterSentMs[8] = {0};
 static uint8_t  chClearStreak[8] = {0,0,0,0,0,0,0,0};
 static uint32_t chClearSinceMs[8] = {0,0,0,0,0,0,0,0};
 #define ENTER_COOLDOWN_MS 150   // 0 = off; 150ms ≈ ~6–7 msgs/sec max per ch
-#define CLEAR_POLLS_AFTER_ARM 2
-#define CLEAR_MS_AFTER_ARM    120
+#define CLEAR_POLLS_AFTER_ARM 3
+#define CLEAR_MS_AFTER_ARM    200
 
 static void resetPresenceForNewRound(){
   for (uint8_t i=0;i<8;i++){
